@@ -444,7 +444,7 @@ def _quiet_library_logs(respect_env=False):
     try:
         from loguru import logger
         logger.remove()
-        logger.add(lambda _: None, level="TRACE")
+        logger.add(sys.stdout, level="INFO")
     except Exception:
         pass
 
@@ -507,9 +507,16 @@ def _patch_robotic_arm_skip():
         log("INFO", f"🎯 困难题型跳过规则已加载（{len(BLOCKED_PROMPTS)} 项）")
 
 def _hc_token_ready(driver):
-    val = driver.execute_script(
-        "return document.querySelector('textarea[name=\"h-captcha-response\"]')?.value || ''")
-    return val if len((val or "").strip()) > 30 else None
+    try:
+        val = driver.execute_script(
+            "return (document.querySelector('textarea[name=\"h-captcha-response\"]')?.value || "
+            "document.querySelector('iframe[data-hcaptcha-response]')?.getAttribute('data-hcaptcha-response') || "
+            "(window.hcaptcha && typeof window.hcaptcha.getResponse === 'function' ? window.hcaptcha.getResponse() : '') || "
+            "'');"
+        )
+        return val if len((val or "").strip()) > 20 else None
+    except Exception:
+        return None
 
 async def _hc_agent_solve(driver, rounds):
     from playwright.async_api import async_playwright
@@ -633,29 +640,56 @@ def hide_recaptcha_iframes(driver):
     except Exception:
         pass
 
-def solve_captcha(driver, timeout=120) -> bool:
-    time.sleep(3)
-    has_hcaptcha = has_hcaptcha_on_page(driver)
-    if has_hcaptcha:
-        log("INFO", "🔍 检测到 hCaptcha，自动处理中...")
-        if solve_hcaptcha_agent(driver):
-            log("INFO", "✅ 验证码已通过")
+def wait_hcaptcha_nopecha_solved(driver, timeout=30):
+    if not has_hcaptcha_on_page(driver):
+        return True
+    if _hc_token_ready(driver):
+        log("INFO", "✅ hCaptcha 已存在有效 token")
+        return True
+    log("INFO", f"🔍 等待 NopeCHA 自动求解 hCaptcha（上限 {timeout}s）...")
+    start = time.time()
+    deadline = start + timeout
+    while time.time() < deadline:
+        if _hc_token_ready(driver):
+            elapsed = time.time() - start
+            log("INFO", f"✅ NopeCHA 已成功求解 hCaptcha（用时 {elapsed:.0f}s）")
             return True
-        log("ERROR", "验证码处理失败")
-        return False
-    log("INFO", "等待验证码加载（5s）...")
-    time.sleep(5)
-    for f in driver.find_elements(By.CSS_SELECTOR, "iframe"):
-        src = f.get_attribute("src") or ""
-        if "hcaptcha" in src:
-            log("INFO", "延迟发现 hCaptcha，自动处理中...")
-            if solve_hcaptcha_agent(driver):
-                log("INFO", "✅ 验证码已通过")
+        time.sleep(1.5)
+    return False
+
+def solve_captcha(driver, timeout=45) -> bool:
+    time.sleep(2)
+    has_hc = has_hcaptcha_on_page(driver)
+    if not has_hc:
+        for f in driver.find_elements(By.CSS_SELECTOR, "iframe"):
+            src = f.get_attribute("src") or ""
+            if "hcaptcha" in src:
+                has_hc = True
+                break
+
+    if not has_hc:
+        log("INFO", "未检测到 hCaptcha 验证码")
+        return True
+
+    log("INFO", "🔍 检测到 hCaptcha，优先使用 NopeCHA 自动求解...")
+    if wait_hcaptcha_nopecha_solved(driver, timeout=25):
+        return True
+
+    log("INFO", "🔄 NopeCHA 未就绪，尝试使用 AI 模型求解 hCaptcha...")
+    try:
+        if solve_hcaptcha_agent(driver, rounds=1):
+            if _hc_token_ready(driver):
+                log("INFO", "✅ AI 模型成功求解 hCaptcha")
                 return True
-            log("ERROR", "验证码处理失败")
-            return False
-    log("WARN", "未检测到验证码，跳过")
-    return True
+    except Exception as e:
+        log("WARN", f"AI 模型求解过程异常: {e}")
+
+    if _hc_token_ready(driver):
+        log("INFO", "✅ hCaptcha token 已就绪")
+        return True
+
+    log("WARN", "⚠️ hCaptcha 未能在时限内获取到 token，尝试继续流程...")
+    return False
 
 # ══════════════════════════════════════════════════════════════════
 #  ── IP 地理探测 & NopeCHA patch ────────────────────────────────
@@ -1116,38 +1150,60 @@ def vps8_checkin():
 
         login_ok = False
         for login_retry in range(3):
-            log("INFO", ">>> 登录页")
+            log("INFO", f">>> 打开登录页 (第 {login_retry+1}/3 次尝试)")
             driver.get(LOGIN_URL)
             wait_ready(driver)
-            time.sleep(5)
-            screenshot(driver, f"01_login_page_{login_retry+1}")
+            time.sleep(4)
+            dismiss_cookie(driver)
             hide_social_login(driver)
+            screenshot(driver, f"01_login_page_{login_retry+1}")
 
-            if not solve_captcha(driver):
-                continue
-
-            hide_recaptcha_iframes(driver)
-            time.sleep(5)
-
+            # 1. 检查并输入账号密码表单
             if not is_element_present(driver, "#email"):
-                return fail(driver, tg_token, tg_chat_id, email, "err_form", "找不到表单")
+                log("WARN", "未找到 #email 输入框，等待 5s 重试...")
+                time.sleep(5)
+                if not is_element_present(driver, "#email"):
+                    log("ERROR", "页面未包含登录表单")
+                    continue
 
+            log("INFO", "✍️ 正在输入账号与密码...")
             human_type(driver, "#email", email)
+            time.sleep(random.uniform(0.5, 1.0))
             human_type(driver, "#password", password)
-            driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
+            time.sleep(random.uniform(0.5, 1.0))
 
+            # 2. 求解验证码（NopeCHA 优先，自动获取 hCaptcha/reCAPTCHA token）
+            log("INFO", "🔍 正在检测并求解验证码...")
+            solve_captcha(driver, timeout=30)
+            hide_recaptcha_iframes(driver)
+            time.sleep(1)
+
+            # 3. 提交登录表单
+            log("INFO", "🚀 提交登录表单...")
+            try:
+                submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
+                driver.execute_script("arguments[0].scrollIntoView(true);", submit_btn)
+                time.sleep(0.5)
+                submit_btn.click()
+            except Exception as e:
+                log("WARN", f"点击登录按钮异常: {e}，尝试 JS click")
+                driver.execute_script("document.querySelector('button[type=\"submit\"]').click()")
+
+            # 4. 等待登录成功跳转或 API 结果
             deadline = time.time() + 45
             api_login_detected = False
             while time.time() < deadline:
                 try:
                     cur = (driver.current_url or "").rstrip("/")
+                    # 检测 FOSSBilling API 响应
                     if cur.endswith("/api/guest/client/login"):
                         body = driver.execute_script("return (document.body?.innerText || '').slice(0, 500)").replace(" ", "")
                         if '"error":null' in body or '"role":"client"' in body:
                             api_login_detected = True
                             login_ok = True
                             break
-                    if cur != LOGIN_URL_NORM and not is_element_visible(driver, "#email"):
+                    # 检测已离开登录页（如跳到 /dashboard 或 /points/signin）
+                    if "dashboard" in cur or "points" in cur or (cur != LOGIN_URL_NORM and not is_element_visible(driver, "#email")):
                         login_ok = True
                         break
                 except Exception:
@@ -1155,11 +1211,16 @@ def vps8_checkin():
                 time.sleep(1)
 
             if login_ok:
+                log("INFO", "✅ 成功登录账号！")
                 if api_login_detected:
                     driver.get(SIGNIN_URL)
                     wait_ready(driver)
                     time.sleep(3)
                 break
+            else:
+                log("WARN", f"第 {login_retry+1} 次登录未跳转，截屏保存...")
+                screenshot(driver, f"err_login_attempt_{login_retry+1}")
+                time.sleep(5)
 
         if not login_ok:
             return fail(driver, tg_token, tg_chat_id, email, "err_login", "登录失败")

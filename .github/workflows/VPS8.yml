@@ -152,6 +152,7 @@ jobs:
         id: attempt1
         if: steps.check.outputs.skip != 'true'
         continue-on-error: true
+        timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
       - name: 备份第 1 次截图并等待重试
@@ -163,12 +164,24 @@ jobs:
             rm -f screenshots/*.png
             echo "已备份第一次截图"
           fi
-          echo "等待 60 秒后重试..."
-          sleep 60
+          echo "等待 30 秒后重试..."
+          sleep 30
 
       - name: 执行签到（第 2 次）
         if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
+        timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
+
+      - name: 上传执行截图
+        if: always() && steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.job }}-${{ github.run_number }}
+          path: |
+            screenshots-attempt1/
+            screenshots/
+          retention-days: 3
+          if-no-files-found: ignore
 
   # ========================= F2 =========================
   sign-f2:
@@ -266,6 +279,7 @@ jobs:
         id: attempt1
         if: steps.check.outputs.skip != 'true'
         continue-on-error: true
+        timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
       - name: 备份第 1 次截图并等待重试
@@ -277,12 +291,24 @@ jobs:
             rm -f screenshots/*.png
             echo "已备份第一次截图"
           fi
-          echo "等待 60 秒后重试..."
-          sleep 60
+          echo "等待 30 秒后重试..."
+          sleep 30
 
       - name: 执行签到（第 2 次）
         if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
+        timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
+
+      - name: 上传执行截图
+        if: always() && steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.job }}-${{ github.run_number }}
+          path: |
+            screenshots-attempt1/
+            screenshots/
+          retention-days: 3
+          if-no-files-found: ignore
 
   # ========================= F3 =========================
   sign-f3:
@@ -380,6 +406,7 @@ jobs:
         id: attempt1
         if: steps.check.outputs.skip != 'true'
         continue-on-error: true
+        timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
       - name: 备份第 1 次截图并等待重试
@@ -391,12 +418,24 @@ jobs:
             rm -f screenshots/*.png
             echo "已备份第一次截图"
           fi
-          echo "等待 60 秒后重试..."
-          sleep 60
+          echo "等待 30 秒后重试..."
+          sleep 30
 
       - name: 执行签到（第 2 次）
         if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
+        timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
+
+      - name: 上传执行截图
+        if: always() && steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.job }}-${{ github.run_number }}
+          path: |
+            screenshots-attempt1/
+            screenshots/
+          retention-days: 3
+          if-no-files-found: ignore
 
   # ========================= 统一维护与清理 =========================
   maintenance:
