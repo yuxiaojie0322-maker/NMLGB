@@ -1,6 +1,9 @@
-name: VPS8 签到（并行）
+name: VPS8 自动签到与续期
 
 on:
+  schedule:
+    # 每天 UTC 00:30 (北京时间 08:30) 定时自动运行
+    - cron: '30 0 * * *'
   workflow_dispatch:
     inputs:
       enable_f1:
@@ -20,7 +23,7 @@ on:
         type: boolean
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 # =========================================================
@@ -46,40 +49,48 @@ env:
   VPS8_RENEW_TEST: "0"
   TG_BOT_TOKEN:    ${{ secrets.TG_BOT_TOKEN }}
   TG_CHAT_ID:      ${{ secrets.TG_CHAT_ID }}
-  OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}   # 对应服务的 key
-  OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}  # 对应服务的 base_url
-  OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}     # 对应的 vision 模型名
-  NOPECHA_KEY:     ${{ secrets.NOPECHA_KEY }}     # NopeCHA的 key
+  OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+  OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}
+  NOPECHA_KEY:     ${{ secrets.NOPECHA_KEY }}
 # =========================================================
 
 jobs:
   # ========================= F1 =========================
   sign-f1:
     name: F1 签到
-    if: ${{ inputs.enable_f1 }}
+    if: ${{ github.event_name == 'schedule' || inputs.enable_f1 }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - name: 导出账号配置
+      - name: 检查账号配置
+        id: check
         run: |
-          echo "NODE_LINK=${{ env.F1_NODE_LINK }}" >> $GITHUB_ENV
-          echo "VPS8=${{ env.F1_VPS8 }}" >> $GITHUB_ENV
+          if [ -z "$F1_VPS8" ]; then
+            echo "⚠️ [跳过] 未检测到 F1 账号 (VPS8) 密匙，跳过本次执行"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "NODE_LINK=${{ env.F1_NODE_LINK }}" >> "$GITHUB_ENV"
+            echo "VPS8=${{ env.F1_VPS8 }}" >> "$GITHUB_ENV"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 错峰等待
+        if: steps.check.outputs.skip != 'true'
         run: sleep ${{ env.F1_STAGGER }}
 
       - name: 检出代码仓库
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/scripts
-          token: ${{ secrets.REPO_TOKEN }}
 
       - name: 配置 Python 3.11
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 缓存 pip
+        if: steps.check.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -88,21 +99,25 @@ jobs:
             ${{ runner.os }}-pip-${{ github.job }}-
 
       - name: 安装系统依赖
+        if: steps.check.outputs.skip != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            xvfb fonts-noto-cjk p7zip-full git
+            xvfb fonts-noto-cjk p7zip-full jq netcat-openbsd git
 
       - name: 安装 Python 库
+        if: steps.check.outputs.skip != 'true'
         run: |
           pip install -q seleniumbase requests playwright opencv-python-headless \
                         msgpack typer matplotlib google-genai httpx \
-                        loguru pydantic-settings tenacity pytz
+                        loguru pydantic-settings tenacity pytz "requests[socks]"
 
       - name: 安装 ChromeDriver
+        if: steps.check.outputs.skip != 'true'
         run: seleniumbase install chromedriver
 
       - name: 下载并解压 NopeCHA 扩展
+        if: steps.check.outputs.skip != 'true'
         run: |
           mkdir -p scripts/extensions/nopecha
           wget -q -O scripts/extensions/nopecha/chromium.zip \
@@ -110,6 +125,7 @@ jobs:
           7z x -y scripts/extensions/nopecha/chromium.zip -oscripts/extensions/nopecha/unpacked
 
       - name: 克隆 hcaptcha-challenger
+        if: steps.check.outputs.skip != 'true'
         run: |
           git clone --depth 1 https://github.com/aoi675145/hcaptcha.git hcaptcha-challenger
           cd hcaptcha-challenger
@@ -119,6 +135,7 @@ jobs:
           git rev-parse HEAD
 
       - name: 设置代理
+        if: steps.check.outputs.skip != 'true'
         run: |
           chmod +x scripts/setup_proxy.sh
           if ! bash scripts/setup_proxy.sh; then
@@ -133,11 +150,12 @@ jobs:
 
       - name: 执行签到（第 1 次）
         id: attempt1
+        if: steps.check.outputs.skip != 'true'
         continue-on-error: true
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
-      - name: 备份第一次截图并等待
-        if: steps.attempt1.outcome == 'failure'
+      - name: 备份第 1 次截图并等待重试
+        if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         run: |
           if [ -d screenshots ]; then
             mkdir -p screenshots-attempt1
@@ -149,47 +167,44 @@ jobs:
           sleep 60
 
       - name: 执行签到（第 2 次）
-        if: steps.attempt1.outcome == 'failure'
+        if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
-
-#      - name: 上传所有截图
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: screenshots-f1-${{ github.run_number }}
-#          path: |
-#            screenshots-attempt1/
-#            screenshots/
-#          retention-days: 7
-#          if-no-files-found: ignore
 
   # ========================= F2 =========================
   sign-f2:
     name: F2 签到
-    if: ${{ inputs.enable_f2 }}
+    if: ${{ github.event_name == 'schedule' || inputs.enable_f2 }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - name: 导出账号配置
+      - name: 检查账号配置
+        id: check
         run: |
-          echo "NODE_LINK=${{ env.F2_NODE_LINK }}" >> $GITHUB_ENV
-          echo "VPS8=${{ env.F2_VPS8 }}" >> $GITHUB_ENV
+          if [ -z "$F2_VPS8" ]; then
+            echo "⚠️ [跳过] 未检测到 F2 账号 (VPS82) 密匙，跳过本次执行"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "NODE_LINK=${{ env.F2_NODE_LINK }}" >> "$GITHUB_ENV"
+            echo "VPS8=${{ env.F2_VPS8 }}" >> "$GITHUB_ENV"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 错峰等待
+        if: steps.check.outputs.skip != 'true'
         run: sleep ${{ env.F2_STAGGER }}
 
       - name: 检出代码仓库
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/scripts
-          token: ${{ secrets.REPO_TOKEN }}
 
       - name: 配置 Python 3.11
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 缓存 pip
+        if: steps.check.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -198,21 +213,25 @@ jobs:
             ${{ runner.os }}-pip-${{ github.job }}-
 
       - name: 安装系统依赖
+        if: steps.check.outputs.skip != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            xvfb fonts-noto-cjk p7zip-full git
+            xvfb fonts-noto-cjk p7zip-full jq netcat-openbsd git
 
       - name: 安装 Python 库
+        if: steps.check.outputs.skip != 'true'
         run: |
           pip install -q seleniumbase requests playwright opencv-python-headless \
                         msgpack typer matplotlib google-genai httpx \
-                        loguru pydantic-settings tenacity pytz
+                        loguru pydantic-settings tenacity pytz "requests[socks]"
 
       - name: 安装 ChromeDriver
+        if: steps.check.outputs.skip != 'true'
         run: seleniumbase install chromedriver
 
       - name: 下载并解压 NopeCHA 扩展
+        if: steps.check.outputs.skip != 'true'
         run: |
           mkdir -p scripts/extensions/nopecha
           wget -q -O scripts/extensions/nopecha/chromium.zip \
@@ -220,6 +239,7 @@ jobs:
           7z x -y scripts/extensions/nopecha/chromium.zip -oscripts/extensions/nopecha/unpacked
 
       - name: 克隆 hcaptcha-challenger
+        if: steps.check.outputs.skip != 'true'
         run: |
           git clone --depth 1 https://github.com/aoi675145/hcaptcha.git hcaptcha-challenger
           cd hcaptcha-challenger
@@ -229,6 +249,7 @@ jobs:
           git rev-parse HEAD
 
       - name: 设置代理
+        if: steps.check.outputs.skip != 'true'
         run: |
           chmod +x scripts/setup_proxy.sh
           if ! bash scripts/setup_proxy.sh; then
@@ -243,11 +264,12 @@ jobs:
 
       - name: 执行签到（第 1 次）
         id: attempt1
+        if: steps.check.outputs.skip != 'true'
         continue-on-error: true
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
-      - name: 备份第一次截图并等待
-        if: steps.attempt1.outcome == 'failure'
+      - name: 备份第 1 次截图并等待重试
+        if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         run: |
           if [ -d screenshots ]; then
             mkdir -p screenshots-attempt1
@@ -259,47 +281,44 @@ jobs:
           sleep 60
 
       - name: 执行签到（第 2 次）
-        if: steps.attempt1.outcome == 'failure'
+        if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
-
-#      - name: 上传所有截图
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: screenshots-f2-${{ github.run_number }}
-#          path: |
-#            screenshots-attempt1/
-#            screenshots/
-#          retention-days: 7
-#          if-no-files-found: ignore
 
   # ========================= F3 =========================
   sign-f3:
     name: F3 签到
-    if: ${{ inputs.enable_f3 }}
+    if: ${{ github.event_name == 'schedule' || inputs.enable_f3 }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - name: 导出账号配置
+      - name: 检查账号配置
+        id: check
         run: |
-          echo "NODE_LINK=${{ env.F3_NODE_LINK }}" >> $GITHUB_ENV
-          echo "VPS8=${{ env.F3_VPS8 }}" >> $GITHUB_ENV
+          if [ -z "$F3_VPS8" ]; then
+            echo "⚠️ [跳过] 未检测到 F3 账号 (VPS83) 密匙，跳过本次执行"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "NODE_LINK=${{ env.F3_NODE_LINK }}" >> "$GITHUB_ENV"
+            echo "VPS8=${{ env.F3_VPS8 }}" >> "$GITHUB_ENV"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: 错峰等待
+        if: steps.check.outputs.skip != 'true'
         run: sleep ${{ env.F3_STAGGER }}
 
       - name: 检出代码仓库
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/scripts
-          token: ${{ secrets.REPO_TOKEN }}
 
       - name: 配置 Python 3.11
+        if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 缓存 pip
+        if: steps.check.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
@@ -308,21 +327,25 @@ jobs:
             ${{ runner.os }}-pip-${{ github.job }}-
 
       - name: 安装系统依赖
+        if: steps.check.outputs.skip != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            xvfb fonts-noto-cjk p7zip-full git
+            xvfb fonts-noto-cjk p7zip-full jq netcat-openbsd git
 
       - name: 安装 Python 库
+        if: steps.check.outputs.skip != 'true'
         run: |
           pip install -q seleniumbase requests playwright opencv-python-headless \
                         msgpack typer matplotlib google-genai httpx \
-                        loguru pydantic-settings tenacity pytz
+                        loguru pydantic-settings tenacity pytz "requests[socks]"
 
       - name: 安装 ChromeDriver
+        if: steps.check.outputs.skip != 'true'
         run: seleniumbase install chromedriver
 
       - name: 下载并解压 NopeCHA 扩展
+        if: steps.check.outputs.skip != 'true'
         run: |
           mkdir -p scripts/extensions/nopecha
           wget -q -O scripts/extensions/nopecha/chromium.zip \
@@ -330,6 +353,7 @@ jobs:
           7z x -y scripts/extensions/nopecha/chromium.zip -oscripts/extensions/nopecha/unpacked
 
       - name: 克隆 hcaptcha-challenger
+        if: steps.check.outputs.skip != 'true'
         run: |
           git clone --depth 1 https://github.com/aoi675145/hcaptcha.git hcaptcha-challenger
           cd hcaptcha-challenger
@@ -339,6 +363,7 @@ jobs:
           git rev-parse HEAD
 
       - name: 设置代理
+        if: steps.check.outputs.skip != 'true'
         run: |
           chmod +x scripts/setup_proxy.sh
           if ! bash scripts/setup_proxy.sh; then
@@ -353,11 +378,12 @@ jobs:
 
       - name: 执行签到（第 1 次）
         id: attempt1
+        if: steps.check.outputs.skip != 'true'
         continue-on-error: true
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
-      - name: 备份第一次截图并等待
-        if: steps.attempt1.outcome == 'failure'
+      - name: 备份第 1 次截图并等待重试
+        if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         run: |
           if [ -d screenshots ]; then
             mkdir -p screenshots-attempt1
@@ -369,32 +395,65 @@ jobs:
           sleep 60
 
       - name: 执行签到（第 2 次）
-        if: steps.attempt1.outcome == 'failure'
+        if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
-#      - name: 上传所有截图
-#        if: always()
-#        uses: actions/upload-artifact@v4
-#        with:
-#          name: screenshots-f3-${{ github.run_number }}
-#          path: |
-#            screenshots-attempt1/
-#            screenshots/
-#          retention-days: 7
-#          if-no-files-found: ignore
-
-  # ========================= 统一清理 =========================
-  cleanup:
-    name: 清理历史运行记录
+  # ========================= 统一维护与清理 =========================
+  maintenance:
+    name: 仓库保活与清理历史记录
     runs-on: ubuntu-22.04
     needs: [sign-f1, sign-f2, sign-f3]
     if: always()
+    permissions:
+      contents: write
+      actions: write
     steps:
-      - name: 清理历史运行记录
-        uses: Mattraks/delete-workflow-runs@v2
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 提交 time.txt 保持仓库活跃
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "时间戳无变化，无需提交"
+          else
+            git commit -m "⏱️ 更新时间文件: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin HEAD || true
+          fi
+
+      - name: 清理历史运行记录（保留最新 2 条）
+        uses: actions/github-script@v7
         with:
-          token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          delete_workflow_pattern: ${{ github.workflow }}
-          retain_days: 0
-          keep_minimum_runs: 1
+          script: |
+            const KEEP = 2;
+            const workflows = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+            });
+            const wf = workflows.data.workflows.find(w => w.name === "VPS8 自动签到与续期");
+            if (!wf) {
+              console.log("未找到 workflow，跳过清理");
+              return;
+            }
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner:       context.repo.owner,
+                repo:        context.repo.repo,
+                workflow_id: wf.id,
+                per_page:    100,
+              }
+            );
+            const toDelete = runs.slice(KEEP);
+            console.log(`共 ${runs.length} 条 run，保留 ${KEEP} 条，删除 ${toDelete.length} 条`);
+            for (const run of toDelete) {
+              await github.rest.actions.deleteWorkflowRun({
+                owner:  context.repo.owner,
+                repo:   context.repo.repo,
+                run_id: run.id,
+              });
+              console.log(`已删除 run #${run.run_number} (id=${run.id})`);
+            }
