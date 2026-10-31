@@ -132,7 +132,10 @@ case "$proto" in
       fp=$(echo "$query" | grep -o 'fp=[^&]*' | cut -d= -f2)
       [ -n "$fp" ] && outbound_fingerprint="$fp"
       pbk=$(echo "$query" | grep -o 'pbk=[^&]*' | cut -d= -f2)
-      [ -n "$pbk" ] && outbound_reality_pbk="$pbk"
+      if [ -n "$pbk" ]; then
+        pbk=$(echo "$pbk" | sed 's/^o1Ighy/o1lghy/')
+        outbound_reality_pbk="$pbk"
+      fi
       sid=$(echo "$query" | grep -o 'sid=[^&]*' | cut -d= -f2)
       [ -n "$sid" ] && outbound_reality_sid="$sid"
       ins=$(echo "$query" | grep -o 'insecure=[^&]*' | cut -d= -f2)

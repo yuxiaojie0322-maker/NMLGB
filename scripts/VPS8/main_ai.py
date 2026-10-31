@@ -640,13 +640,39 @@ def hide_recaptcha_iframes(driver):
     except Exception:
         pass
 
-def wait_hcaptcha_nopecha_solved(driver, timeout=30):
+def trigger_hcaptcha_checkbox(driver):
+    try:
+        if _hc_token_ready(driver):
+            return True
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='hcaptcha.com']")
+        for frame in frames:
+            src = frame.get_attribute("src") or ""
+            if "sitekey" in src or "checkbox" in src:
+                driver.switch_to.frame(frame)
+                try:
+                    box = driver.find_element(By.ID, "checkbox") or driver.find_element(By.ID, "anchor")
+                    if box and box.is_displayed():
+                        box.click()
+                        log("INFO", "🖱️ 已触发点击 hCaptcha 选框以激活求解")
+                except Exception:
+                    pass
+                driver.switch_to.default_content()
+                break
+    except Exception:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+def wait_hcaptcha_nopecha_solved(driver, timeout=35):
     if not has_hcaptcha_on_page(driver):
         return True
     if _hc_token_ready(driver):
         log("INFO", "✅ hCaptcha 已存在有效 token")
         return True
     log("INFO", f"🔍 等待 NopeCHA 自动求解 hCaptcha（上限 {timeout}s）...")
+    time.sleep(2)
+    trigger_hcaptcha_checkbox(driver)
     start = time.time()
     deadline = start + timeout
     while time.time() < deadline:
@@ -657,7 +683,7 @@ def wait_hcaptcha_nopecha_solved(driver, timeout=30):
         time.sleep(1.5)
     return False
 
-def solve_captcha(driver, timeout=45) -> bool:
+def solve_captcha(driver, timeout=40) -> bool:
     time.sleep(2)
     has_hc = has_hcaptcha_on_page(driver)
     if not has_hc:
@@ -672,7 +698,7 @@ def solve_captcha(driver, timeout=45) -> bool:
         return True
 
     log("INFO", "🔍 检测到 hCaptcha，优先使用 NopeCHA 自动求解...")
-    if wait_hcaptcha_nopecha_solved(driver, timeout=25):
+    if wait_hcaptcha_nopecha_solved(driver, timeout=35):
         return True
 
     log("INFO", "🔄 NopeCHA 未就绪，尝试使用 AI 模型求解 hCaptcha...")
@@ -769,15 +795,25 @@ def patch_nopecha(nopecha_path: str, api_key: str) -> bool:
             return True
         inject = f"""// NopeCHA-Inject
 (function(){{
-    const s={{enabled:true,key:"{api_key}",auto_solve_hcaptcha:false,auto_solve_recaptcha:true}};
+    const s={{
+        enabled: true,
+        key: "{api_key}",
+        auto_solve_hcaptcha: true,
+        auto_solve_recaptcha: true,
+        auto_solve_turnstile: true,
+        hcaptcha_auto_open: true,
+        hcaptcha_auto_solve: true,
+        recaptcha_auto_open: true,
+        recaptcha_auto_solve: true
+    }};
     function w(){{
         chrome.storage.local.set({{settings:s,key:"{api_key}"}});
         chrome.storage.sync&&chrome.storage.sync.set({{settings:s,key:"{api_key}"}});
     }}
-    w();setTimeout(w,1000);setTimeout(w,3000);
+    w();setTimeout(w,500);setTimeout(w,1500);setTimeout(w,3000);
 }})();\n"""
         open(bg, "w", encoding="utf-8").write(inject + content)
-        log("INFO", "✅ NopeCHA patch 成功")
+        log("INFO", "✅ NopeCHA patch 成功 (已开启 hCaptcha 与 reCAPTCHA 自动求解)")
         return True
     except Exception as e:
         log("ERROR", f"NopeCHA patch 失败: {e}")
