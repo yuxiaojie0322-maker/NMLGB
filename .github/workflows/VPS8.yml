@@ -53,6 +53,7 @@ env:
   OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
   OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}
   NOPECHA_KEY:     ${{ secrets.NOPECHA_KEY }}
+  NONECAP_KEY:     ${{ secrets.NONECAP_KEY || vars.NONECAP_KEY }}
 # =========================================================
 
 jobs:
@@ -109,7 +110,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           pip install -q seleniumbase requests playwright opencv-python-headless \
-                        msgpack typer matplotlib google-genai httpx \
+                        msgpack typer matplotlib google-genai httpx nonecap \
                         loguru pydantic-settings tenacity pytz "requests[socks]"
 
       - name: 安装 ChromeDriver
@@ -236,7 +237,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           pip install -q seleniumbase requests playwright opencv-python-headless \
-                        msgpack typer matplotlib google-genai httpx \
+                        msgpack typer matplotlib google-genai httpx nonecap \
                         loguru pydantic-settings tenacity pytz "requests[socks]"
 
       - name: 安装 ChromeDriver
@@ -363,7 +364,7 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           pip install -q seleniumbase requests playwright opencv-python-headless \
-                        msgpack typer matplotlib google-genai httpx \
+                        msgpack typer matplotlib google-genai httpx nonecap \
                         loguru pydantic-settings tenacity pytz "requests[socks]"
 
       - name: 安装 ChromeDriver

@@ -683,6 +683,67 @@ def wait_hcaptcha_nopecha_solved(driver, timeout=35):
         time.sleep(1.5)
     return False
 
+def get_sitekey(driver):
+    try:
+        sk = driver.execute_script("""
+            const el = document.querySelector('[data-sitekey]');
+            if (el) return el.getAttribute('data-sitekey');
+            for (const f of document.querySelectorAll('iframe[src*="sitekey="]')) {
+                const m = f.src.match(/sitekey=([a-f0-9-]+)/i);
+                if (m) return m[1];
+            }
+            return '';
+        """)
+        if sk:
+            return sk
+    except Exception:
+        pass
+    return "7f30f3d4-581c-4a3c-a8a2-4f6ed25006e4"
+
+def solve_hcaptcha_nonecap(driver) -> bool:
+    key = os.getenv("NONECAP_KEY", "").strip() or os.getenv("NONECAP_API_KEY", "").strip()
+    if not key:
+        return False
+    try:
+        from nonecap import NoneCap
+        sitekey = get_sitekey(driver)
+        current_url = driver.current_url or "https://vps8.zz.cd/login"
+        log("INFO", f"🚀 正在调用 NoneCap 极速求解 hCaptcha (sitekey={sitekey[:8]}...)...")
+        nc = NoneCap(api_key=key)
+        res = nc.solve(
+            type="hcaptcha",
+            sitekey=sitekey,
+            url=current_url,
+            timeout=45
+        )
+        if res.status == "solved" and res.token:
+            token = res.token
+            log("INFO", "✅ NoneCap 成功获取 hCaptcha token！")
+            driver.execute_script("""
+                const token = arguments[0];
+                document.querySelectorAll('textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]').forEach(el => {
+                    el.value = token;
+                });
+                if (window.hcaptcha && typeof window.hcaptcha.setData === 'function') {
+                    try { window.hcaptcha.setData(token); } catch(e){}
+                }
+                // 隐藏遮挡的 iframe，防止遮挡按钮点击
+                document.querySelectorAll('iframe').forEach(f => {
+                    const src = f.getAttribute('src') || '';
+                    if (src.includes('hcaptcha.com')) {
+                        f.style.setProperty('display', 'none', 'important');
+                        f.style.setProperty('visibility', 'hidden', 'important');
+                    }
+                });
+            """, token)
+            time.sleep(1)
+            return True
+        else:
+            log("WARN", f"NoneCap 响应状态: {res.status}")
+    except Exception as e:
+        log("WARN", f"NoneCap 求解异常: {e}")
+    return False
+
 def solve_captcha(driver, timeout=40) -> bool:
     time.sleep(2)
     has_hc = has_hcaptcha_on_page(driver)
@@ -697,10 +758,21 @@ def solve_captcha(driver, timeout=40) -> bool:
         log("INFO", "未检测到 hCaptcha 验证码")
         return True
 
-    log("INFO", "🔍 检测到 hCaptcha，优先使用 NopeCHA 自动求解...")
-    if wait_hcaptcha_nopecha_solved(driver, timeout=35):
+    # 1. 检查是否已有可用 token
+    if _hc_token_ready(driver):
+        log("INFO", "✅ hCaptcha 已存在有效 token")
         return True
 
+    # 2. 首选：使用 NoneCap 极速自动求解
+    if solve_hcaptcha_nonecap(driver):
+        return True
+
+    # 3. 备选：使用 NopeCHA 自动求解
+    log("INFO", "🔍 尝试使用 NopeCHA 自动求解...")
+    if wait_hcaptcha_nopecha_solved(driver, timeout=25):
+        return True
+
+    # 4. 备选：尝试使用 AI 模型求解
     log("INFO", "🔄 NopeCHA 未就绪，尝试使用 AI 模型求解 hCaptcha...")
     try:
         if solve_hcaptcha_agent(driver, rounds=1):
@@ -1217,6 +1289,14 @@ def vps8_checkin():
             # 3. 提交登录表单
             log("INFO", "🚀 提交登录表单...")
             try:
+                driver.execute_script("""
+                    document.querySelectorAll('iframe[src*="hcaptcha.com"]').forEach(f => {
+                        if (f.src.includes('frame=challenge')) {
+                            f.style.setProperty('display', 'none', 'important');
+                            f.style.setProperty('visibility', 'hidden', 'important');
+                        }
+                    });
+                """)
                 submit_btn = driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
                 driver.execute_script("arguments[0].scrollIntoView(true);", submit_btn)
                 time.sleep(0.5)
