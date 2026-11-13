@@ -152,49 +152,84 @@ def parse_account(raw):
 
 
 def build_caption(email, info=None, fail_reason=None, redeem_result=None,
-                  services_info=None, already_signed=False):
-    lines = [f"账号：{email}"]
+                  services_info=None, already_signed=False,
+                  points_before=None, points_gained=None):
+    lines = [f"👤 账号：{email}"]
     if fail_reason:
-        lines += [f"签到状态：❌ 失败", f"原因：{fail_reason}"]
+        lines += ["📊 签到状态：❌ 失败", f"⚠️ 原因：{fail_reason}"]
+        if points_before not in (None, "未知"):
+            lines.append(f"💰 当前积分：{points_before} 分")
     elif info:
+        cur_pt = info.get("points", "未知")
         if already_signed:
-            lines.append("签到状态：ℹ️ 今日已签到")
+            lines.append("📊 签到状态：ℹ️ 今日已签到 (保持不变)")
+            lines.append(f"💰 当前积分：{cur_pt} 分")
         else:
-            lines.append(f"签到状态：{'✅ 已签到' if info.get('is_signed') else '⚠️ 未签到'}")
-        lines.append(f"当前积分：{info.get('points', '未知')}")
+            lines.append("📊 签到状态：✅ 签到成功")
+            if points_before not in (None, "未知"):
+                try:
+                    pt_b = int(points_before)
+                    if points_gained is not None and points_gained > 0:
+                        lines.append(f"💰 签到前积分：{pt_b} 分")
+                        lines.append(f"🎁 本次获得：+{points_gained} 积分")
+                        if not redeem_result:
+                            lines.append(f"📈 签到后积分：{cur_pt} 分")
+                    elif cur_pt != "未知":
+                        pt_a = int(cur_pt)
+                        diff = pt_a - pt_b
+                        if diff > 0:
+                            lines.append(f"💰 签到前积分：{pt_b} 分")
+                            lines.append(f"🎁 本次获得：+{diff} 积分")
+                            lines.append(f"📈 签到后积分：{pt_a} 分")
+                        else:
+                            lines.append(f"💰 当前积分：{cur_pt} 分")
+                    else:
+                        lines.append(f"💰 当前积分：{cur_pt} 分")
+                except Exception:
+                    lines.append(f"💰 当前积分：{cur_pt} 分")
+            else:
+                lines.append(f"💰 当前积分：{cur_pt} 分")
+
         if info.get("streak", "未知") != "未知":
-            lines.append(f"连续签到：{info['streak']} 天")
+            lines.append(f"🔥 连续签到：{info['streak']} 天")
     else:
-        lines.append("签到状态：未知")
+        lines.append("📊 签到状态：未知")
 
     if redeem_result:
-        lines.append(f"兑换结果：{redeem_result}")
+        lines.append(f"💎 兑换结果：{redeem_result}")
+        if info and info.get("points", "未知") != "未知":
+            lines.append(f"💰 兑换后当前剩余积分：{info.get('points')} 分")
 
     if services_info:
         for s in services_info:
-            prefix = "VPS" if s["type"] == "vps" else "域名"
+            prefix = "🖥️ VPS" if s["type"] == "vps" else "🌐 域名"
             line = f"{prefix}：{s['name']} → 到期 {s['expiry_display']}"
             if s.get("renew_result"):
                 line = f"{prefix}：{s['name']} → {s['renew_result']}"
             lines.append(line)
     else:
-        lines.append("VPS：名下暂无活跃订单")
+        lines.append("🖥️ VPS：名下暂无活跃订单")
 
-    lines += ["", "VPS8 Daily Points"]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines += ["", f"⏰ 执行时间：{now_str}", "#VPS8每日签到"]
     return "\n".join(lines)
 
 
 def extract_info(html):
     info = {"points": "未知", "is_signed": False, "streak": "未知"}
-    m = re.search(r'当前积分：\s*<strong>(\d+)</strong>', html)
+    m = re.search(r'当前积分[：:]\s*(?:<strong>)?(\d+)(?:</strong>)?', html)
+    if not m:
+        m = re.search(r'积分[：:]\s*(?:<strong>)?(\d+)(?:</strong>)?', html)
     if m:
         info["points"] = m.group(1)
-    m = re.search(r'今日签到状态：\s*([^\n<]+)', html)
+    m = re.search(r'今日签到状态[：:]\s*([^\n<]+)', html)
     if m:
-        info["is_signed"] = m.group(1).strip() == "已签到"
-    elif "签到成功" in html:
+        info["is_signed"] = "已签到" in m.group(1).strip()
+    elif "签到成功" in html or "今日已签到" in html:
         info["is_signed"] = True
-    m = re.search(r'当前连续签到：\s*(\d+)\s*天', html)
+    m = re.search(r'当前连续签到[：:]\s*(?:<strong>)?(\d+)(?:</strong>)?\s*天', html)
+    if not m:
+        m = re.search(r'连续签到[：:]\s*(?:<strong>)?(\d+)(?:</strong>)?\s*天', html)
     if m:
         info["streak"] = m.group(1)
     return info
@@ -1353,10 +1388,14 @@ def vps8_checkin():
         screenshot(driver, "03_signin_page")
 
         html = driver.page_source
+        before_info = extract_info(html)
+        points_before = before_info.get("points")
         already_signed = is_signed(html)
         signed = already_signed
+        points_gained = None
+
         if already_signed:
-            info = extract_info(html)
+            info = before_info
             dismiss_cookie(driver)
         else:
             info = None
@@ -1380,6 +1419,13 @@ def vps8_checkin():
                 if ok:
                     signed = True
                     info = result
+                    if points_before not in (None, "未知") and info.get("points") not in (None, "未知"):
+                        try:
+                            diff = int(info["points"]) - int(points_before)
+                            if diff > 0:
+                                points_gained = diff
+                        except Exception:
+                            pass
                     break
                 else:
                     last_fail_reason = result
@@ -1396,10 +1442,11 @@ def vps8_checkin():
             services_info = check_and_renew_all(driver)
             finish(driver, tg_token, tg_chat_id, "success",
                    build_caption(email, info=info, redeem_result=redeem_result,
-                                 services_info=services_info, already_signed=already_signed))
+                                 services_info=services_info, already_signed=already_signed,
+                                 points_before=points_before, points_gained=points_gained))
             return True, "✅ 签到成功" if not already_signed else "ℹ️ 今日已签到"
 
-        finish(driver, tg_token, tg_chat_id, "unknown", build_caption(email, fail_reason=last_fail_reason or "状态未更新"))
+        finish(driver, tg_token, tg_chat_id, "unknown", build_caption(email, fail_reason=last_fail_reason or "状态未更新", points_before=points_before))
         return False, "⚠️ 状态未确认"
 
     except Exception as e:
