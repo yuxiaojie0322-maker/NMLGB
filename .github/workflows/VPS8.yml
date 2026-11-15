@@ -1,9 +1,6 @@
 name: VPS8 自动签到与续期
 
 on:
-  schedule:
-    # 每天 UTC 00:30 (北京时间 08:30) 定时自动运行
-    - cron: '30 0 * * *'
   workflow_dispatch:
     inputs:
       enable_f1:
@@ -21,6 +18,8 @@ on:
         required: false
         default: false
         type: boolean
+  repository_dispatch:
+    types: [run-vps8]
 
 permissions:
   contents: write
@@ -60,7 +59,7 @@ jobs:
   # ========================= F1 =========================
   sign-f1:
     name: F1 签到
-    if: ${{ github.event_name == 'schedule' || inputs.enable_f1 }}
+    if: ${{ github.event_name == 'repository_dispatch' || github.event_name == 'schedule' || inputs.enable_f1 }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -187,7 +186,7 @@ jobs:
   # ========================= F2 =========================
   sign-f2:
     name: F2 签到
-    if: ${{ github.event_name == 'schedule' || inputs.enable_f2 }}
+    if: ${{ github.event_name == 'repository_dispatch' || github.event_name == 'schedule' || inputs.enable_f2 }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
@@ -314,7 +313,7 @@ jobs:
   # ========================= F3 =========================
   sign-f3:
     name: F3 签到
-    if: ${{ github.event_name == 'schedule' || inputs.enable_f3 }}
+    if: ${{ github.event_name == 'repository_dispatch' || github.event_name == 'schedule' || inputs.enable_f3 }}
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
