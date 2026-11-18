@@ -1289,48 +1289,121 @@ def renew_single_vps(driver, display_name, manage_url):
             return "❌ 未跳转到发票页"
             
         time.sleep(3)
+        screenshot(driver, "08_invoice_payment_methods")
+
+        # 1. 查找并点击“客户余额”支付选项
         balance_found = False
-        for sel in ['label[onclick*="ClientBalance"]', 'input[type="radio"][value*="balance"]', '.payment-method label']:
-            try:
-                for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                    if el.is_displayed():
-                        driver.execute_script("arguments[0].click();", el)
-                        balance_found = True
-                        break
-            except Exception:
-                continue
-            if balance_found:
-                break
-                
+        
+        # 方式 A: 执行前端 JavaScript 深度扫描匹配（适配各类主题的 button/a/label）
+        try:
+            res = driver.execute_script("""
+                const candidates = Array.from(document.querySelectorAll('button, a, label, input, div.btn'));
+                for (const el of candidates) {
+                    const txt = (el.innerText || el.textContent || el.value || el.getAttribute('title') || '').trim();
+                    const onclick = el.getAttribute('onclick') || '';
+                    if (txt.includes('客户余额') || txt.includes('余额支付') || (txt.includes('余额') && !txt.includes('不足')) ||
+                        txt.toLowerCase().includes('clientbalance') || (txt.toLowerCase().includes('balance') && !txt.toLowerCase().includes('insufficient')) ||
+                        onclick.includes('ClientBalance') || onclick.includes('balance') || el.classList.contains('logo-custom')) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return { success: true, text: txt, tag: el.tagName };
+                    }
+                }
+                return { success: false };
+            """)
+            if res and res.get("success"):
+                log("INFO", f"✅ 已通过 JS 点击余额支付选项: [{res.get('tag')}] {res.get('text')}")
+                balance_found = True
+        except Exception as e:
+            log("WARN", f"JS 扫描余额选项异常: {e}")
+        
         if not balance_found:
+            # 方式 B: Selenium 常见选择器兜底匹配
+            selectors = [
+                "//button[contains(., '客户余额') or contains(., '余额') or contains(., 'Balance')]",
+                "//a[contains(., '客户余额') or contains(., '余额') or contains(., 'Balance')]",
+                "//label[contains(., '客户余额') or contains(., '余额') or contains(@onclick, 'ClientBalance') or contains(@onclick, 'balance')]",
+                'label[onclick*="ClientBalance"]',
+                'button.logo-custom',
+                'button[gateway_id]',
+                'button[name="gateway_id"]',
+                'input[type="radio"][value*="balance"]',
+                '.payment-method label',
+            ]
+            for sel in selectors:
+                try:
+                    by = By.XPATH if sel.startswith("//") else By.CSS_SELECTOR
+                    for el in driver.find_elements(by, sel):
+                        if el.is_displayed():
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                            time.sleep(0.5)
+                            driver.execute_script("arguments[0].click();", el)
+                            balance_found = True
+                            log("INFO", f"✅ 已点击余额支付选项: {sel}")
+                            break
+                except Exception:
+                    continue
+                if balance_found:
+                    break
+
+        if not balance_found:
+            screenshot(driver, "err_balance_not_found")
             return "❌ 找不到余额支付选项"
-            
-        time.sleep(2)
+
+        time.sleep(3)
+
+        # 检查点击余额后是否直接完成了支付跳转
+        if any(kw in driver.page_source for kw in ["已支付", "支付成功", "Paid", "Payment successful"]):
+            log("INFO", "✅ 点击余额后直接完成支付！")
+            screenshot(driver, "09_invoice_paid")
+            return "✅ 续期成功"
+
+        # 2. 如果页面需要二次点击支付按钮（如 #single 或 Pay Now 按钮）
         payment_found = False
-        for sel in ["#single", 'a[href*="allow_subscription=0"]', 'a.btn-success']:
+        pay_selectors = [
+            "//button[contains(., '支付') or contains(., 'Pay') or contains(., '立即付款') or contains(., 'Confirm')]",
+            "//a[contains(., '支付') or contains(., 'Pay') or contains(., '立即付款') or contains(@class, 'btn-success')]",
+            "#single",
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'a[href*="allow_subscription=0"]',
+            'a.btn-success',
+            '.pay-now',
+            'button.btn-primary'
+        ]
+        for sel in pay_selectors:
             try:
-                for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                    if el.is_displayed():
+                by = By.XPATH if sel.startswith("//") else By.CSS_SELECTOR
+                for el in driver.find_elements(by, sel):
+                    txt = (el.text or el.get_attribute("value") or "").strip()
+                    if el.is_displayed() and (not txt or any(k in txt for k in ["支付", "Pay", "付款", "立即", "Confirm", "Submit"])):
+                        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                        time.sleep(0.5)
                         driver.execute_script("arguments[0].click();", el)
                         payment_found = True
+                        log("INFO", f"✅ 已点击确认支付按钮: {txt or sel}")
                         break
             except Exception:
                 continue
             if payment_found:
                 break
-                
-        if not payment_found:
-            return "❌ 找不到支付按钮"
-            
-        time.sleep(5)
+
+        # 3. 轮询等待最终发票支付状态
         deadline = time.time() + 60
         while time.time() < deadline:
             try:
-                if any(kw in driver.page_source for kw in ["已支付", "支付成功", "Paid", "Payment successful"]):
+                page_src = driver.page_source
+                if any(kw in page_src for kw in ["已支付", "支付成功", "Paid", "Payment successful"]):
+                    screenshot(driver, "09_invoice_paid")
+                    return "✅ 续期成功"
+                if "unpaid" not in page_src.lower() and "paid" in page_src.lower():
+                    screenshot(driver, "09_invoice_paid")
                     return "✅ 续期成功"
             except Exception:
                 pass
             time.sleep(3)
+            
+        screenshot(driver, "err_invoice_unconfirmed")
         return "⚠️ 支付结果未确认"
     except Exception as e:
         return f"❌ 续费失败: {str(e)[:80]}"
