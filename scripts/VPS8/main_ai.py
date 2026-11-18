@@ -48,6 +48,7 @@ LOGIN_URL_NORM          = LOGIN_URL.rstrip("/")
 LOGIN_API_ENDPOINT_NORM = "https://vps8.zz.cd/api/guest/client/login"
 
 _NOPECHA_WARM = False
+_LAST_CAPTCHA_TOKEN = ""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -278,16 +279,28 @@ def has_hcaptcha_on_page(driver) -> bool:
 
 def _hide_hcaptcha_ui(driver):
     try:
-        driver.execute_script("""() => {
+        driver.execute_script("""
             document.querySelectorAll('iframe[src*="hcaptcha"]').forEach(el => {
-                el.style.setProperty('display', 'none', 'important');
-                el.style.setProperty('visibility', 'hidden', 'important');
+                if (el.src && el.src.includes('frame=challenge')) {
+                    el.style.setProperty('display', 'none', 'important');
+                    el.style.setProperty('visibility', 'hidden', 'important');
+                    if (el.parentElement && el.parentElement.tagName === 'DIV') {
+                        el.parentElement.style.setProperty('display', 'none', 'important');
+                    }
+                }
             });
             document.querySelectorAll('.h-captcha').forEach(el => {
                 el.style.setProperty('display', 'none', 'important');
             });
-        }""")
-        log("INFO", "✅ 已隐藏 hCaptcha UI")
+            document.querySelectorAll('div[style*="position: fixed"], div[style*="position:fixed"]').forEach(el => {
+                const s = el.getAttribute('style') || '';
+                if (s.includes('z-index') || s.includes('opacity') || s.includes('cursor: pointer')) {
+                    el.style.setProperty('display', 'none', 'important');
+                    el.style.setProperty('pointer-events', 'none', 'important');
+                }
+            });
+        """)
+        log("INFO", "✅ 已隐藏 hCaptcha UI 及遮罩")
     except Exception:
         pass
 
@@ -295,11 +308,11 @@ def _hide_hcaptcha_ui(driver):
 def has_recaptcha_on_page(driver) -> bool:
     try:
         return driver.execute_script("""
-            const els = document.querySelectorAll('.g-recaptcha, iframe[src*="recaptcha"]');
+            const els = document.querySelectorAll('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha/api2"], .g-recaptcha');
             for (const el of els) {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
-                if (rect.width > 50 && rect.height > 50 && 
+                if (rect.width > 20 && rect.height > 20 && 
                     style.display !== 'none' && 
                     style.visibility !== 'hidden' && 
                     parseFloat(style.opacity) > 0.1) {
@@ -314,10 +327,10 @@ def has_recaptcha_on_page(driver) -> bool:
 
 def get_recaptcha_token(driver):
     try:
-        val = driver.execute_script(
-            "var el = document.getElementById('g-recaptcha-response'); "
-            "return el ? el.value : '';"
-        )
+        val = driver.execute_script("""
+            const el = document.getElementById('g-recaptcha-response') || document.querySelector('textarea[name="g-recaptcha-response"]');
+            return el ? el.value : '';
+        """)
         return val if len((val or "").strip()) > 10 else None
     except Exception:
         return None
@@ -736,6 +749,7 @@ def get_sitekey(driver):
     return "7f30f3d4-581c-4a3c-a8a2-4f6ed25006e4"
 
 def solve_hcaptcha_nonecap(driver) -> bool:
+    global _LAST_CAPTCHA_TOKEN
     key = os.getenv("NONECAP_KEY", "").strip() or os.getenv("NONECAP_API_KEY", "").strip()
     if not key:
         return False
@@ -753,21 +767,34 @@ def solve_hcaptcha_nonecap(driver) -> bool:
         )
         if res.status == "solved" and res.token:
             token = res.token
+            _LAST_CAPTCHA_TOKEN = token
             log("INFO", "✅ NoneCap 成功获取 hCaptcha token！")
             driver.execute_script("""
                 const token = arguments[0];
+                window.__nonecap_token = token;
+                window.__captcha_token = token;
                 document.querySelectorAll('textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]').forEach(el => {
                     el.value = token;
                 });
                 if (window.hcaptcha && typeof window.hcaptcha.setData === 'function') {
                     try { window.hcaptcha.setData(token); } catch(e){}
                 }
-                // 隐藏遮挡的 iframe，防止遮挡按钮点击
+                // 隐藏遮挡的 iframe 与遮罩，防止遮挡按钮点击
                 document.querySelectorAll('iframe').forEach(f => {
                     const src = f.getAttribute('src') || '';
                     if (src.includes('hcaptcha.com')) {
                         f.style.setProperty('display', 'none', 'important');
                         f.style.setProperty('visibility', 'hidden', 'important');
+                        if (f.parentElement && f.parentElement.tagName === 'DIV') {
+                            f.parentElement.style.setProperty('display', 'none', 'important');
+                        }
+                    }
+                });
+                document.querySelectorAll('div[style*="position: fixed"], div[style*="position:fixed"]').forEach(el => {
+                    const s = el.getAttribute('style') || '';
+                    if (s.includes('z-index') || s.includes('opacity') || s.includes('cursor: pointer')) {
+                        el.style.setProperty('display', 'none', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
                     }
                 });
             """, token)
@@ -888,9 +915,6 @@ def check_nopecha_availability(proxy=None):
     return "", None
 
 def patch_nopecha(nopecha_path: str, api_key: str) -> bool:
-    if not api_key:
-        log("INFO", "✅ 试用 NopeCHA（未注入付费 KEY）")
-        return False
     candidates = [os.path.join(nopecha_path, "assets", "qrmm9f.js"), os.path.join(nopecha_path, "background.js")]
     bg = next((c for c in candidates if os.path.exists(c)), None)
     if not bg:
@@ -900,11 +924,12 @@ def patch_nopecha(nopecha_path: str, api_key: str) -> bool:
         if "NopeCHA-Inject" in content:
             log("INFO", "NopeCHA 已注入")
             return True
+        key_str = api_key or ""
         inject = f"""// NopeCHA-Inject
 (function(){{
     const s={{
         enabled: true,
-        key: "{api_key}",
+        key: "{key_str}",
         auto_solve_hcaptcha: true,
         auto_solve_recaptcha: true,
         auto_solve_turnstile: true,
@@ -914,13 +939,16 @@ def patch_nopecha(nopecha_path: str, api_key: str) -> bool:
         recaptcha_auto_solve: true
     }};
     function w(){{
-        chrome.storage.local.set({{settings:s,key:"{api_key}"}});
-        chrome.storage.sync&&chrome.storage.sync.set({{settings:s,key:"{api_key}"}});
+        chrome.storage.local.set({{settings:s,key:"{key_str}"}});
+        chrome.storage.sync&&chrome.storage.sync.set({{settings:s,key:"{key_str}"}});
     }}
     w();setTimeout(w,500);setTimeout(w,1500);setTimeout(w,3000);
 }})();\n"""
         open(bg, "w", encoding="utf-8").write(inject + content)
-        log("INFO", "✅ NopeCHA patch 成功 (已开启 hCaptcha 与 reCAPTCHA 自动求解)")
+        if api_key:
+            log("INFO", "✅ NopeCHA patch 成功 (已开启 hCaptcha 与 reCAPTCHA 自动求解)")
+        else:
+            log("INFO", "✅ NopeCHA patch 成功 (已开启 hCaptcha 与 reCAPTCHA 试用模式自动求解)")
         return True
     except Exception as e:
         log("ERROR", f"NopeCHA patch 失败: {e}")
@@ -941,31 +969,29 @@ def wait_signin_button(driver, timeout=20):
     except Exception:
         return None
 
-# ★ 核心优化：解完 hCaptcha 强制刷新页面，清空上下文，让 NopeCHA 不再 idle
+# ★ 核心优化：确保验证码就绪与遮罩消除
 def ensure_signin_page_captcha_ready(driver, label=""):
     if has_hcaptcha_on_page(driver):
         log("INFO", f"{label}检测到 hCaptcha，自动处理中...")
         if not solve_captcha(driver):
             return False
-        
-        # 检查是否还有 reCAPTCHA，如果有就刷新（由于现在用 API 提交，刷新绝不会卡死）
-        if has_recaptcha_on_page(driver):
-            log("INFO", f"🔄 {label}解完 hCaptcha，强制刷新页面以消除干扰...")
-            driver.get(SIGNIN_URL)
-            wait_ready(driver)
-            time.sleep(SIGNIN_PAGE_SETTLE)
-            dismiss_cookie(driver)
-        else:
-            _hide_hcaptcha_ui(driver)
+        _hide_hcaptcha_ui(driver)
         time.sleep(1)
 
     if has_recaptcha_on_page(driver):
+        log("INFO", f"{label}检测到 reCAPTCHA，正在等待求解...")
         if not wait_recaptcha_solved(driver):
-            log("WARN", f"⚠️ {label} NopeCHA 超时，尝试直接提交...")
+            tok = get_recaptcha_token(driver)
+            if tok:
+                log("INFO", f"✅ {label} reCAPTCHA 已存在有效 token")
+            else:
+                log("ERROR", f"❌ {label} reCAPTCHA 未能成功求解，放弃本次盲目提交以防 9999 报错")
+                return False
             
     return True
 
 def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
+    global _LAST_CAPTCHA_TOKEN
     log("INFO", f"=== 签到流程第 {attempt_num} 次 ===")
     dismiss_cookie(driver)
 
@@ -983,18 +1009,26 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
     log("INFO", ">>> 直接通过内部 API 提交签到")
     time.sleep(random.uniform(1.5, 3.0))
 
+    tok = _LAST_CAPTCHA_TOKEN or get_recaptcha_token(driver) or _hc_token_ready(driver) or ""
+    if tok:
+        _LAST_CAPTCHA_TOKEN = tok
+
     try:
         driver.set_script_timeout(30)
-        # 使用 JS Fetch 直接发起请求，自带超时逻辑，不会让前端卡死
+        # 使用 JS Fetch 发起请求，确保同时携带 g-recaptcha-response 与 h-captcha-response，并优先采用 urlencoded 编码提交
         res_json = driver.execute_async_script("""
+            const passedToken = arguments[0] || '';
             const done = arguments[arguments.length - 1];
             const timeoutId = setTimeout(() => done({ error: "请求超时" }), 25000);
             
             try {
-                const form = document.querySelector('#points-signin-submit').closest('form');
+                const form = document.querySelector('#points-signin-submit')?.closest('form') || document.querySelector('form[action*="points"]');
                 if (!form) { clearTimeout(timeoutId); done({ error: "找不到表单" }); return; }
                 
-                const url = bb.restUrl(form.getAttribute('action'));
+                const rawAction = form.getAttribute('action') || 'client/points/signin';
+                const url = (window.bb && typeof window.bb.restUrl === 'function')
+                    ? window.bb.restUrl(rawAction)
+                    : (rawAction.startsWith('http') ? rawAction : '/api/' + rawAction.replace(/^\\//, ''));
                 const method = form.getAttribute('method') || 'POST';
                 const formData = new FormData(form);
                 
@@ -1006,19 +1040,63 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
                 const data = {};
                 for (const [key, value] of formData.entries()) { data[key] = value; }
                 
+                // 关键点：将解出来的 token 填入 g-recaptcha-response 与 h-captcha-response
+                const grEl = document.querySelector('textarea[name="g-recaptcha-response"]') || document.getElementById('g-recaptcha-response');
+                const hcEl = document.querySelector('textarea[name="h-captcha-response"]');
+                const activeToken = passedToken || window.__nonecap_token || window.__captcha_token || (grEl ? grEl.value : '') || (hcEl ? hcEl.value : '');
+                
+                if (activeToken) {
+                    data['g-recaptcha-response'] = activeToken;
+                    data['h-captcha-response'] = activeToken;
+                    if (grEl) grEl.value = activeToken;
+                    if (hcEl) hcEl.value = activeToken;
+                }
+                
+                const searchParams = new URLSearchParams();
+                for (const k in data) { searchParams.append(k, data[k]); }
+
+                // 优先以 application/x-www-form-urlencoded 发送，使 PHP 原生解析入 $_POST
                 fetch(url, {
                     method: method,
-                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                    body: JSON.stringify(data)
+                    headers: { 
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 
+                        'Accept': 'application/json, text/javascript, */*; q=0.01',
+                        'X-Requested-With': 'XMLHttpRequest'
+                    },
+                    body: searchParams.toString()
                 })
                 .then(res => res.json())
-                .then(res => { clearTimeout(timeoutId); done(res); })
-                .catch(err => { clearTimeout(timeoutId); done({ error: err.toString() }); });
+                .then(res => {
+                    // 若接口报错且和验证码相关，尝试用 JSON 格式兜底再次请求
+                    if (res && res.error && String(res.error.message || res.error).toLowerCase().includes('recaptcha')) {
+                        fetch(url, {
+                            method: method,
+                            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                            body: JSON.stringify(data)
+                        })
+                        .then(r => r.json())
+                        .then(r => { clearTimeout(timeoutId); done(r); })
+                        .catch(e => { clearTimeout(timeoutId); done(res); });
+                    } else {
+                        clearTimeout(timeoutId);
+                        done(res);
+                    }
+                })
+                .catch(err => {
+                    fetch(url, {
+                        method: method,
+                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                        body: JSON.stringify(data)
+                    })
+                    .then(r => r.json())
+                    .then(r => { clearTimeout(timeoutId); done(r); })
+                    .catch(e => { clearTimeout(timeoutId); done({ error: e.toString() }); });
+                });
             } catch(e) {
                 clearTimeout(timeoutId);
                 done({ error: "JS 异常: " + e.toString() });
             }
-        """)
+        """, tok)
 
         if not res_json:
             log("WARN", "API 无响应")
@@ -1027,9 +1105,15 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
         if res_json.get("error"):
             err = res_json["error"]
             msg = err.get("message") if isinstance(err, dict) else str(err)
+            if any(k in msg.lower() for k in ["already", "已签到", "重复", "已领取"]):
+                log("INFO", f"ℹ️ 今日已签到: {msg}")
+                driver.get(SIGNIN_URL)
+                wait_ready(driver)
+                time.sleep(2)
+                return True, extract_info(driver.page_source)
             log("WARN", f"签到接口报错: {msg}")
             if "9999" in str(err) or "captcha" in str(msg).lower():
-                return False, "9999"
+                return False, "9999 (验证码校验失败)"
             return False, msg[:50]
 
         log("INFO", "✅ 签到接口返回成功")
