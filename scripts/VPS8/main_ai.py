@@ -991,7 +991,6 @@ def ensure_signin_page_captcha_ready(driver, label=""):
     return True
 
 def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
-    global _LAST_CAPTCHA_TOKEN
     log("INFO", f"=== 签到流程第 {attempt_num} 次 ===")
     dismiss_cookie(driver)
 
@@ -1006,18 +1005,50 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
     if btn is None:
         return False, "找不到签到按钮"
 
-    log("INFO", ">>> 直接通过内部 API 提交签到")
-    time.sleep(random.uniform(1.5, 3.0))
+    time.sleep(random.uniform(1.0, 2.0))
 
-    tok = _LAST_CAPTCHA_TOKEN or get_recaptcha_token(driver) or _hc_token_ready(driver) or ""
-    if tok:
-        _LAST_CAPTCHA_TOKEN = tok
+    # 1. 优先尝试页面原生按钮点击（已打绿勾时直接由前端表单完成原生提交）
+    log("INFO", ">>> [步骤 1] 尝试触发页面“立即签到”原生点击...")
+    try:
+        driver.execute_script("""
+            document.querySelectorAll('iframe[src*="bframe"]').forEach(f => {
+                f.style.setProperty('display', 'none', 'important');
+            });
+            document.querySelectorAll('div[style*="position: fixed"], div[style*="position:fixed"]').forEach(el => {
+                const s = el.getAttribute('style') || '';
+                if (s.includes('z-index') || s.includes('opacity')) {
+                    el.style.setProperty('display', 'none', 'important');
+                    el.style.setProperty('pointer-events', 'none', 'important');
+                }
+            });
+        """)
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+        time.sleep(0.5)
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
+        log("INFO", "✅ 已点击“立即签到”按钮，等待页面更新...")
+        time.sleep(4)
+        
+        # 检查是否直接签到成功
+        html_now = driver.page_source
+        if is_signed(html_now):
+            log("INFO", "✅ 原生点击签到成功！")
+            return True, extract_info(html_now)
+    except Exception as e:
+        log("WARN", f"原生点击异常: {e}")
+
+    # 2. 若原生点击未即时更新页面，使用精准验证码 Token 进行 API 兜底提交
+    log("INFO", ">>> [步骤 2] 原生点击后页面未直接标记成功，调用精准 API 提交签到...")
+    recaptcha_tok = get_recaptcha_token(driver) or ""
+    hcaptcha_tok = _hc_token_ready(driver) or ""
 
     try:
         driver.set_script_timeout(30)
-        # 使用 JS Fetch 发起请求，确保同时携带 g-recaptcha-response 与 h-captcha-response，并优先采用 urlencoded 编码提交
         res_json = driver.execute_async_script("""
-            const passedToken = arguments[0] || '';
+            const recaptchaToken = arguments[0] || '';
+            const hcaptchaToken = arguments[1] || '';
             const done = arguments[arguments.length - 1];
             const timeoutId = setTimeout(() => done({ error: "请求超时" }), 25000);
             
@@ -1040,35 +1071,66 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
                 const data = {};
                 for (const [key, value] of formData.entries()) { data[key] = value; }
                 
-                // 关键点：将解出来的 token 填入 g-recaptcha-response 与 h-captcha-response
+                // 从 DOM 提取当前页面最新鲜真实的 Token，绝不交叉混淆
                 const grEl = document.querySelector('textarea[name="g-recaptcha-response"]') || document.getElementById('g-recaptcha-response');
                 const hcEl = document.querySelector('textarea[name="h-captcha-response"]');
-                const activeToken = passedToken || window.__nonecap_token || window.__captcha_token || (grEl ? grEl.value : '') || (hcEl ? hcEl.value : '');
                 
-                if (activeToken) {
-                    data['g-recaptcha-response'] = activeToken;
-                    data['h-captcha-response'] = activeToken;
-                    if (grEl) grEl.value = activeToken;
-                    if (hcEl) hcEl.value = activeToken;
+                const finalRecaptcha = recaptchaToken || (grEl ? grEl.value : '').trim();
+                const finalHcaptcha = hcaptchaToken || (hcEl ? hcEl.value : '').trim();
+                
+                if (finalRecaptcha) {
+                    data['g-recaptcha-response'] = finalRecaptcha;
+                    if (grEl) grEl.value = finalRecaptcha;
+                    delete data['h-captcha-response'];
+                } else if (finalHcaptcha) {
+                    data['h-captcha-response'] = finalHcaptcha;
+                    if (hcEl) hcEl.value = finalHcaptcha;
+                    delete data['g-recaptcha-response'];
                 }
-                
-                const searchParams = new URLSearchParams();
-                for (const k in data) { searchParams.append(k, data[k]); }
 
-                // 优先以 application/x-www-form-urlencoded 发送，使 PHP 原生解析入 $_POST
-                fetch(url, {
-                    method: method,
-                    headers: { 
-                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 
-                        'Accept': 'application/json, text/javascript, */*; q=0.01',
-                        'X-Requested-With': 'XMLHttpRequest'
-                    },
-                    body: searchParams.toString()
-                })
-                .then(res => res.json())
-                .then(res => {
-                    // 若接口报错且和验证码相关，尝试用 JSON 格式兜底再次请求
-                    if (res && res.error && String(res.error.message || res.error).toLowerCase().includes('recaptcha')) {
+                // 优先尝试 FOSSBilling 原生客户端函数 window.bb.post
+                if (window.bb && typeof window.bb.post === 'function') {
+                    window.bb.post(
+                        rawAction,
+                        data,
+                        function(result) { clearTimeout(timeoutId); done({ result: result }); },
+                        function(error) { doFetch(error); }
+                    );
+                    return;
+                }
+
+                doFetch(null);
+
+                function doFetch(prevError) {
+                    const searchParams = new URLSearchParams();
+                    for (const k in data) { searchParams.append(k, data[k]); }
+
+                    fetch(url, {
+                        method: method,
+                        headers: { 
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 
+                            'Accept': 'application/json, text/javascript, */*; q=0.01',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        body: searchParams.toString()
+                    })
+                    .then(res => res.json())
+                    .then(res => {
+                        if (res && res.error) {
+                            fetch(url, {
+                                method: method,
+                                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                                body: JSON.stringify(data)
+                            })
+                            .then(r => r.json())
+                            .then(r => { clearTimeout(timeoutId); done(r); })
+                            .catch(e => { clearTimeout(timeoutId); done(res); });
+                        } else {
+                            clearTimeout(timeoutId);
+                            done(res);
+                        }
+                    })
+                    .catch(err => {
                         fetch(url, {
                             method: method,
                             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
@@ -1076,27 +1138,14 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
                         })
                         .then(r => r.json())
                         .then(r => { clearTimeout(timeoutId); done(r); })
-                        .catch(e => { clearTimeout(timeoutId); done(res); });
-                    } else {
-                        clearTimeout(timeoutId);
-                        done(res);
-                    }
-                })
-                .catch(err => {
-                    fetch(url, {
-                        method: method,
-                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                        body: JSON.stringify(data)
-                    })
-                    .then(r => r.json())
-                    .then(r => { clearTimeout(timeoutId); done(r); })
-                    .catch(e => { clearTimeout(timeoutId); done({ error: e.toString() }); });
-                });
+                        .catch(e => { clearTimeout(timeoutId); done(prevError ? { error: prevError } : { error: e.toString() }); });
+                    });
+                }
             } catch(e) {
                 clearTimeout(timeoutId);
                 done({ error: "JS 异常: " + e.toString() });
             }
-        """, tok)
+        """, recaptcha_tok, hcaptcha_tok)
 
         if not res_json:
             log("WARN", "API 无响应")
@@ -1112,8 +1161,10 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
                 time.sleep(2)
                 return True, extract_info(driver.page_source)
             log("WARN", f"签到接口报错: {msg}")
-            if "9999" in str(err) or "captcha" in str(msg).lower():
-                return False, "9999 (验证码校验失败)"
+            if "invalid or expired" in str(msg).lower():
+                return False, f"请求已过期或无效 ({msg[:30]})"
+            if "captcha" in str(msg).lower() or "验证码" in str(msg):
+                return False, "验证码校验失败"
             return False, msg[:50]
 
         log("INFO", "✅ 签到接口返回成功")
@@ -1470,6 +1521,13 @@ def vps8_checkin():
         else:
             time.sleep(SIGNIN_PAGE_SETTLE)
         screenshot(driver, "03_signin_page")
+
+        # ★ 清空登录阶段残留的全局 Token，防止旧凭证污染签到请求
+        _LAST_CAPTCHA_TOKEN = ""
+        try:
+            driver.execute_script("window.__nonecap_token = null; window.__captcha_token = null;")
+        except Exception:
+            pass
 
         html = driver.page_source
         before_info = extract_info(html)
