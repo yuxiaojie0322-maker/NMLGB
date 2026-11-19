@@ -360,6 +360,191 @@ def get_recaptcha_state(driver) -> str:
     return "idle"
 
 
+# ══════════════════════════════════════════════════════════════════
+#  ── reCAPTCHA 视觉求解 (视觉模型自助解题) ──────────────────────
+# ══════════════════════════════════════════════════════════════════
+def _vision_chat(image_b64, prompt, timeout=60):
+    """调 OpenAI 兼容视觉接口, 返回文本或 None"""
+    import base64
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    base_url = (os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1").rstrip("/")
+    model = os.getenv("OPENAI_MODEL", "").strip()
+    if not (api_key and model):
+        return None
+    try:
+        resp = requests.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                ]}],
+                "max_tokens": 300,
+                "temperature": 0,
+            },
+            timeout=timeout,
+        )
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log("WARN", f"视觉模型调用失败: {e}")
+        return None
+
+
+def solve_recaptcha_ai(driver, max_rounds=4) -> bool:
+    """用视觉模型直接解 reCAPTCHA v2 图片挑战。
+    流程: 切入 bframe iframe → 取题目+九宫格截图 → 模型选图 → 点击 → VERIFY → 轮询 token。
+    reCAPTCHA 常有多轮, 每轮重复直到 g-recaptcha-response 出现值。"""
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        log("WARN", "未配置 OPENAI_API_KEY, 跳过 reCAPTCHA AI 求解")
+        return False
+
+    log("INFO", "🤖 尝试使用视觉模型直接求解 reCAPTCHA...")
+    for rnd in range(1, max_rounds + 1):
+        if get_recaptcha_token(driver):
+            log("INFO", f"✅ reCAPTCHA token 已就绪(第{rnd}轮前检测)")
+            return True
+        try:
+            # 定位挑战 iframe (bframe = 图片挑战容器)
+            frames = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="bframe"], iframe[title*="recaptcha 挑战"], iframe[title*="recaptcha challenge"]')
+            frame = None
+            for f in frames:
+                try:
+                    if f.is_displayed() or True:
+                        driver.switch_to.frame(f)
+                        ok = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-challenge, .task-image, table.rc-imageselect-table")
+                        if ok:
+                            frame = f
+                            break
+                        driver.switch_to.default_content()
+                except Exception:
+                    driver.switch_to.default_content()
+            if frame is None:
+                # 挑战未弹出, 先点勾选框(anchor iframe)
+                driver.switch_to.default_content()
+                anchors = driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="anchor"]')
+                for a in anchors:
+                    try:
+                        driver.switch_to.frame(a)
+                        box = driver.find_elements(By.CSS_SELECTOR, "#recaptcha-anchor, .recaptcha-checkbox")
+                        if box:
+                            driver.execute_script("arguments[0].click();", box[0])
+                            log("INFO", "🖱️ 已点击 reCAPTCHA 勾选框")
+                            break
+                    except Exception:
+                        pass
+                    finally:
+                        driver.switch_to.default_content()
+                time.sleep(3)
+                continue
+
+            # 已在挑战 iframe 内: 截挑战区域图 + 取题目
+            prompt_text = ""
+            try:
+                el = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-desc-wrapper, .rc-imageselect-desc")
+                if el:
+                    prompt_text = el[0].text.strip().replace("\n", " ")
+            except Exception:
+                pass
+
+            driver.switch_to.default_content()
+            # 截整页再裁剪不可靠, 直接截 iframe 元素
+            shot_b64 = None
+            try:
+                driver.switch_to.frame(frame)
+                tile_table = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-table-wrapper, table.rc-imageselect-table")
+                target = tile_table[0] if tile_table else driver.find_element(By.TAG_NAME, "body")
+                import base64 as _b64
+                shot_b64 = target.screenshot_as_base64
+            except Exception:
+                try:
+                    shot_b64 = driver.find_element(By.TAG_NAME, "body").screenshot_as_base64
+                except Exception:
+                    pass
+            driver.switch_to.default_content()
+
+            if not shot_b64:
+                log("WARN", f"第{rnd}轮: 拿不到挑战截图")
+                time.sleep(2)
+                continue
+
+            prompt = (
+                "这是 reCAPTCHA 图片验证码挑战截图。"
+                f"题目: {prompt_text or '(见图片顶部说明)'}。"
+                "图是3x3或4x4网格(索引: 上排从左到右1,2,3...; 第二排继续)。"
+                "请选出所有符合题目要求的图片格子编号, 只输出 JSON: {\"pick\": [编号...]}, "
+                "如果没有一格符合输出 {\"pick\": []}, 如果图片是‘跳过/没有符合项’类型也照实判断。"
+            )
+            answer = _vision_chat(shot_b64, prompt)
+            log("INFO", f"第{rnd}轮 题目[{prompt_text[:40]}] 模型判定: {answer}")
+            if not answer:
+                time.sleep(2)
+                continue
+
+            import json as _json, re as _re
+            m = _re.search(r'\{[^}]*\}', answer, _re.S)
+            picks = []
+            if m:
+                try:
+                    picks = [int(x) for x in _json.loads(m.group(0)).get("pick", []) if str(x).strip().isdigit() or isinstance(x, int)]
+                except Exception:
+                    picks = []
+            if not picks:
+                # 模型认为没有符合项 → 点 VERIFY/SKIP 按钮直接提交
+                pass
+
+            # 回到挑战 iframe 点击对应 tile
+            driver.switch_to.frame(frame)
+            tiles = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-tile")
+            clicked = 0
+            for idx in picks:
+                if 1 <= idx <= len(tiles):
+                    try:
+                        driver.execute_script("arguments[0].click();", tiles[idx - 1])
+                        clicked += 1
+                        time.sleep(0.4)
+                    except Exception:
+                        pass
+            # 点 VERIFY (有选择时) 或 SKIP/NEXT (无选择时)
+            try:
+                if clicked:
+                    btn = driver.find_elements(By.CSS_SELECTOR, ".button-holder .rc-button-default, #recaptcha-verify-button")
+                    if btn:
+                        driver.execute_script("arguments[0].click();", btn[0])
+                else:
+                    skip = driver.find_elements(By.CSS_SELECTOR, ".rc-imageselect-dynamic-more, .button-holder button")
+                    # 有些轮次必须选一个, 尝试模型二次判断此处略过, 直接点verify
+                    btn = driver.find_elements(By.CSS_SELECTOR, "#recaptcha-verify-button")
+                    if btn:
+                        driver.execute_script("arguments[0].click();", btn[0])
+            except Exception:
+                pass
+            driver.switch_to.default_content()
+            log("INFO", f"第{rnd}轮: 已选 {clicked} 格并提交, 等待判定...")
+            time.sleep(4)
+
+            # 轮询 token (最多 20s)
+            poll_end = time.time() + 20
+            while time.time() < poll_end:
+                if get_recaptcha_token(driver):
+                    log("INFO", f"✅ 视觉模型成功求解 reCAPTCHA (共 {rnd} 轮)")
+                    return True
+                # 检查是否出现"新挑战"(多轮) — 继续外层循环处理
+                time.sleep(2)
+        except Exception as e:
+            log("WARN", f"reCAPTCHA AI 求解第{rnd}轮异常: {e}")
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+            time.sleep(2)
+    log("WARN", f"视觉模型 {max_rounds} 轮未解出 reCAPTCHA")
+    return False
+
+
 def wait_recaptcha_solved(driver, timeout=RECAPTCHA_SOLVE_TIMEOUT, idle_giveup=None):
     global _NOPECHA_WARM
     if not has_recaptcha_on_page(driver):
@@ -998,7 +1183,26 @@ def wait_signin_button(driver, timeout=20):
 
 # ★ 核心优化：确保验证码就绪与遮罩消除
 def ensure_signin_page_captcha_ready(driver, label=""):
-    # 签到页实为 hCaptcha(截图证实); hCaptcha iframe 渲染慢, 先给最多 8s 等它挂载
+    # 签到页验证码类型诊断: 打印实际检测到的 iframe, 便于远程判断
+    try:
+        diag = driver.execute_script("""
+            const out = {hc: false, gr: false, srcs: []};
+            out.hc = !!document.querySelector('textarea[name="h-captcha-response"], .h-captcha, iframe[src*="hcaptcha"]');
+            for (const f of document.querySelectorAll('iframe')) {
+                const s = f.src || '';
+                if (s.includes('recaptcha')) out.gr = true;
+                if ((s.includes('recaptcha') || s.includes('hcaptcha')) && out.srcs.length < 4) {
+                    out.srcs.push(s.slice(0, 90));
+                }
+            }
+            return out;
+        """)
+        if diag:
+            log("INFO", f"{label}验证码诊断: hCaptcha元素={diag.get('hc')} GoogleReCAPTCHA={diag.get('gr')} iframes={diag.get('srcs')}")
+    except Exception:
+        pass
+
+    # 签到页 hCaptcha 检测(含挂载等待)
     deadline = time.time() + 8
     hc_detected = has_hcaptcha_on_page(driver)
     while not hc_detected and time.time() < deadline:
@@ -1013,12 +1217,17 @@ def ensure_signin_page_captcha_ready(driver, label=""):
         time.sleep(1)
 
     if has_recaptcha_on_page(driver):
-        log("INFO", f"{label}检测到 reCAPTCHA，正在等待求解...")
-        if not wait_recaptcha_solved(driver):
+        log("INFO", f"{label}检测到 reCAPTCHA，正在求解...")
+        # NopeCHA 无 key 时 90s 死等无意义, 缩短到 40s 后转视觉模型
+        if not wait_recaptcha_solved(driver, timeout=40):
             tok = get_recaptcha_token(driver)
             if tok:
                 log("INFO", f"✅ {label} reCAPTCHA 已存在有效 token")
             else:
+                # NopeCHA 无 key 死等无意义 → 直接上视觉模型解题
+                if solve_recaptcha_ai(driver, max_rounds=4):
+                    log("INFO", f"✅ {label} reCAPTCHA 由视觉模型解决")
+                    return True
                 log("ERROR", f"❌ {label} reCAPTCHA 未能成功求解，放弃本次盲目提交以防 9999 报错")
                 return False
 
