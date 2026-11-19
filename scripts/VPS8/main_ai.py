@@ -49,6 +49,7 @@ LOGIN_API_ENDPOINT_NORM = "https://vps8.zz.cd/api/guest/client/login"
 
 _NOPECHA_WARM = False
 _LAST_CAPTCHA_TOKEN = ""
+_LAST_SITEKEY = ""
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -265,14 +266,24 @@ def is_element_present(driver, sel):
 
 # ── 验证码检测与处理 ──────────────────────────────────────────
 def has_hcaptcha_on_page(driver) -> bool:
+    # 三重判定: challenge/checkbox iframe 可见, .h-captcha 容器, 或站点已挂载 hCaptcha 脚本/textarea。
+    # 签到页重载后 hCaptcha iframe 渲染慢, 仅靠 iframe is_displayed() 会漏检 → 落入 reCAPTCHA 误判分支。
     try:
-        for el in driver.find_elements(By.CSS_SELECTOR, 'iframe[src*="hcaptcha"]'):
-            if el.is_displayed():
-                return True
-        for el in driver.find_elements(By.CSS_SELECTOR, '.h-captcha'):
-            if el.is_displayed():
-                return True
-        return False
+        return driver.execute_script("""
+            for (const el of document.querySelectorAll('iframe[src*="hcaptcha"]')) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 5 && r.height > 5) return true;
+            }
+            if (document.querySelector('.h-captcha')) return true;
+            if (document.querySelector('[data-sitekey]')) {
+                const sk = document.querySelector('[data-sitekey]').getAttribute('data-sitekey') || '';
+                if (/[a-f0-9]{8}-[a-f0-9]{4}/i.test(sk)) return true;
+            }
+            if (document.querySelector('script[src*="hcaptcha.com"]')) return true;
+            const ta = document.querySelector('textarea[name="h-captcha-response"]');
+            if (ta) return true;
+            return false;
+        """)
     except Exception:
         return False
 
@@ -306,15 +317,17 @@ def _hide_hcaptcha_ui(driver):
 
 
 def has_recaptcha_on_page(driver) -> bool:
+    # hCaptcha 为兼容部分站点会在宿主页留下 g-recaptcha-response textarea / .g-recaptcha 容器,
+    # 旧逻辑据此误判 reCAPTCHA(签到页实为 hCaptcha, 截图证实)。改为只认 Google reCAPTCHA iframe。
     try:
         return driver.execute_script("""
-            const els = document.querySelectorAll('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha/api2"], .g-recaptcha');
-            for (const el of els) {
+            const gFrames = document.querySelectorAll('iframe[src*="google.com/recaptcha"], iframe[src*="recaptcha/api2"], iframe[src*="recaptcha/enterprise"]');
+            for (const el of gFrames) {
                 const rect = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
-                if (rect.width > 20 && rect.height > 20 && 
-                    style.display !== 'none' && 
-                    style.visibility !== 'hidden' && 
+                if (rect.width > 20 && rect.height > 20 &&
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
                     parseFloat(style.opacity) > 0.1) {
                     return true;
                 }
@@ -732,6 +745,8 @@ def wait_hcaptcha_nopecha_solved(driver, timeout=35):
     return False
 
 def get_sitekey(driver):
+    # 优先级: 页面 data-sitekey → iframe src → 上次成功缓存 → 已知站内 sitekey
+    global _LAST_SITEKEY
     try:
         sk = driver.execute_script("""
             const el = document.querySelector('[data-sitekey]');
@@ -743,9 +758,13 @@ def get_sitekey(driver):
             return '';
         """)
         if sk:
+            _LAST_SITEKEY = sk
             return sk
     except Exception:
         pass
+    if _LAST_SITEKEY:
+        log("INFO", f"sitekey 页面未取到，用上次成功缓存: {_LAST_SITEKEY[:8]}...")
+        return _LAST_SITEKEY
     return "7f30f3d4-581c-4a3c-a8a2-4f6ed25006e4"
 
 def solve_hcaptcha_nonecap(driver) -> bool:
@@ -758,17 +777,22 @@ def solve_hcaptcha_nonecap(driver) -> bool:
         sitekey = get_sitekey(driver)
         current_url = driver.current_url or "https://vps8.zz.cd/login"
         log("INFO", f"🚀 正在调用 NoneCap 极速求解 hCaptcha (sitekey={sitekey[:8]}...)...")
+        # token 与求解时的浏览器 UA 绑定: 告诉 NoneCap 用页面当前 UA 求解, 提交时才不会被风控拒
+        try:
+            driver_ua = driver.execute_script("return navigator.userAgent")
+        except Exception:
+            driver_ua = None
         nc = NoneCap(api_key=key)
-        res = nc.solve(
-            type="hcaptcha",
-            sitekey=sitekey,
-            url=current_url,
-            timeout=45
-        )
+        solve_kwargs = dict(type="hcaptcha", sitekey=sitekey, url=current_url, timeout=60)
+        if driver_ua:
+            solve_kwargs["user_agent"] = driver_ua
+        res = nc.solve(**solve_kwargs)
         if res.status == "solved" and res.token:
             token = res.token
             _LAST_CAPTCHA_TOKEN = token
             log("INFO", "✅ NoneCap 成功获取 hCaptcha token！")
+            if res.warnings:
+                log("WARN", f"NoneCap warnings: {res.warnings}")
             driver.execute_script("""
                 const token = arguments[0];
                 window.__nonecap_token = token;
@@ -825,17 +849,15 @@ def solve_captcha(driver, timeout=40) -> bool:
         log("INFO", "✅ hCaptcha 已存在有效 token")
         return True
 
-    # 2. 首选：使用 NoneCap 极速自动求解
-    if solve_hcaptcha_nonecap(driver):
-        return True
+    # 2. 首选：NoneCap 极速求解，失败重试一次（偶发上游抖动）
+    for attempt in (1, 2):
+        if solve_hcaptcha_nonecap(driver):
+            return True
+        log("WARN", f"NoneCap 第 {attempt}/2 次求解未成功，{'重试' if attempt == 1 else '转备选通道'}")
+        time.sleep(2)
 
-    # 3. 备选：使用 NopeCHA 自动求解
-    log("INFO", "🔍 尝试使用 NopeCHA 自动求解...")
-    if wait_hcaptcha_nopecha_solved(driver, timeout=25):
-        return True
-
-    # 4. 备选：尝试使用 AI 模型求解
-    log("INFO", "🔄 NopeCHA 未就绪，尝试使用 AI 模型求解 hCaptcha...")
+    # 3. 备选：AI 模型求解（比无 key 的 NopeCHA 死等更快出结果）
+    log("INFO", "🔄 尝试使用 AI 模型求解 hCaptcha...")
     try:
         if solve_hcaptcha_agent(driver, rounds=1):
             if _hc_token_ready(driver):
@@ -843,6 +865,11 @@ def solve_captcha(driver, timeout=40) -> bool:
                 return True
     except Exception as e:
         log("WARN", f"AI 模型求解过程异常: {e}")
+
+    # 4. 备选：NopeCHA 扩展（无 key 时靠试用模式，成功率低，放最后兜底）
+    log("INFO", "🔍 尝试使用 NopeCHA 自动求解...")
+    if wait_hcaptcha_nopecha_solved(driver, timeout=25):
+        return True
 
     if _hc_token_ready(driver):
         log("INFO", "✅ hCaptcha token 已就绪")
@@ -971,7 +998,14 @@ def wait_signin_button(driver, timeout=20):
 
 # ★ 核心优化：确保验证码就绪与遮罩消除
 def ensure_signin_page_captcha_ready(driver, label=""):
-    if has_hcaptcha_on_page(driver):
+    # 签到页实为 hCaptcha(截图证实); hCaptcha iframe 渲染慢, 先给最多 8s 等它挂载
+    deadline = time.time() + 8
+    hc_detected = has_hcaptcha_on_page(driver)
+    while not hc_detected and time.time() < deadline:
+        time.sleep(1.5)
+        hc_detected = has_hcaptcha_on_page(driver)
+
+    if hc_detected:
         log("INFO", f"{label}检测到 hCaptcha，自动处理中...")
         if not solve_captcha(driver):
             return False
@@ -987,7 +1021,7 @@ def ensure_signin_page_captcha_ready(driver, label=""):
             else:
                 log("ERROR", f"❌ {label} reCAPTCHA 未能成功求解，放弃本次盲目提交以防 9999 报错")
                 return False
-            
+
     return True
 
 def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
@@ -1039,10 +1073,16 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
     except Exception as e:
         log("WARN", f"原生点击异常: {e}")
 
-    # 2. 若原生点击未即时更新页面，使用精准验证码 Token 进行 API 兜底提交
     log("INFO", ">>> [步骤 2] 原生点击后页面未直接标记成功，调用精准 API 提交签到...")
-    recaptcha_tok = get_recaptcha_token(driver) or ""
+    #    站点为 hCaptcha(截图证实): h-captcha-response 优先, 绝不让 hCaptcha 兼容层留下的
+    #    空 g-recaptcha textarea 顶掉真 token (旧逻辑 recaptcha 优先导致 token 混淆/提交超时)
+    recaptcha_tok = ""
+    gr_el_val = get_recaptcha_token(driver) or ""
     hcaptcha_tok = _hc_token_ready(driver) or ""
+    if gr_el_val and not hcaptcha_tok and has_recaptcha_on_page(driver):
+        # 只有页面确实挂着 Google reCAPTCHA iframe 时才用 recaptcha token
+        recaptcha_tok = gr_el_val
+    log("INFO", f"兜底提交 token: hcaptcha={'有' if hcaptcha_tok else '无'}, recaptcha={'有' if recaptcha_tok else '无'}")
 
     try:
         driver.set_script_timeout(30)
@@ -1071,21 +1111,21 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
                 const data = {};
                 for (const [key, value] of formData.entries()) { data[key] = value; }
                 
-                // 从 DOM 提取当前页面最新鲜真实的 Token，绝不交叉混淆
+                // 从 DOM 提取当前页面最新鲜真实的 Token；本站为 hCaptcha，h-captcha-response 优先
                 const grEl = document.querySelector('textarea[name="g-recaptcha-response"]') || document.getElementById('g-recaptcha-response');
                 const hcEl = document.querySelector('textarea[name="h-captcha-response"]');
-                
-                const finalRecaptcha = recaptchaToken || (grEl ? grEl.value : '').trim();
+
                 const finalHcaptcha = hcaptchaToken || (hcEl ? hcEl.value : '').trim();
-                
-                if (finalRecaptcha) {
-                    data['g-recaptcha-response'] = finalRecaptcha;
-                    if (grEl) grEl.value = finalRecaptcha;
-                    delete data['h-captcha-response'];
-                } else if (finalHcaptcha) {
+                const finalRecaptcha = recaptchaToken || (grEl ? grEl.value : '').trim();
+
+                if (finalHcaptcha) {
                     data['h-captcha-response'] = finalHcaptcha;
                     if (hcEl) hcEl.value = finalHcaptcha;
                     delete data['g-recaptcha-response'];
+                } else if (finalRecaptcha) {
+                    data['g-recaptcha-response'] = finalRecaptcha;
+                    if (grEl) grEl.value = finalRecaptcha;
+                    delete data['h-captcha-response'];
                 }
 
                 // 优先尝试 FOSSBilling 原生客户端函数 window.bb.post
