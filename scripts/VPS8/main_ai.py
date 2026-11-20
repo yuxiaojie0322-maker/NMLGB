@@ -387,7 +387,20 @@ def _vision_chat(image_b64, prompt, timeout=60):
             timeout=timeout,
         )
         data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
+        choices = data.get("choices") or []
+        if not choices:
+            # 上游可能返回 {"error": {...}} / 限流体, 打印真实内容便于排障 (旧代码硬取 content 直接 KeyError)
+            log("WARN", f"视觉模型响应异常 (HTTP {resp.status_code}): {str(data)[:300]}")
+            return None
+        msg = choices[0].get("message") or {}
+        content = msg.get("content")
+        if not content and msg.get("refusal"):
+            log("WARN", f"视觉模型拒绝回答: {str(msg['refusal'])[:100]}")
+        content = (content or "").strip()
+        return content or None
+    except requests.exceptions.RequestException as e:
+        log("WARN", f"视觉模型请求失败: {e}")
+        return None
     except Exception as e:
         log("WARN", f"视觉模型调用失败: {e}")
         return None
@@ -1294,12 +1307,12 @@ def do_signin_flow(driver, tg_token, tg_chat_id, email, attempt_num):
     log("INFO", f"兜底提交 token: hcaptcha={'有' if hcaptcha_tok else '无'}, recaptcha={'有' if recaptcha_tok else '无'}")
 
     try:
-        driver.set_script_timeout(30)
+        driver.set_script_timeout(55)
         res_json = driver.execute_async_script("""
             const recaptchaToken = arguments[0] || '';
             const hcaptchaToken = arguments[1] || '';
             const done = arguments[arguments.length - 1];
-            const timeoutId = setTimeout(() => done({ error: "请求超时" }), 25000);
+            const timeoutId = setTimeout(() => done({ error: "请求超时" }), 45000);
             
             try {
                 const form = document.querySelector('#points-signin-submit')?.closest('form') || document.querySelector('form[action*="points"]');
