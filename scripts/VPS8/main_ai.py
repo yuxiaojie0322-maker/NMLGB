@@ -386,27 +386,60 @@ def _vision_chat(image_b64, prompt, timeout=60):
             },
             timeout=timeout,
         )
-        data = resp.json()
-        choices = data.get("choices") or []
-        if not choices:
-            # 上游可能返回 {"error": {...}} / 限流体, 打印真实内容便于排障 (旧代码硬取 content 直接 KeyError)
-            log("WARN", f"视觉模型响应异常 (HTTP {resp.status_code}): {str(data)[:300]}")
-            return None
-        msg = choices[0].get("message") or {}
-        content = msg.get("content")
-        if not content and msg.get("refusal"):
-            log("WARN", f"视觉模型拒绝回答: {str(msg['refusal'])[:100]}")
-        content = (content or "").strip()
-        return content or None
     except requests.exceptions.RequestException as e:
         log("WARN", f"视觉模型请求失败: {e}")
         return None
-    except Exception as e:
-        log("WARN", f"视觉模型调用失败: {e}")
-        return None
+
+    for attempt in (1, 2):
+        try:
+            data = resp.json()
+        except Exception as e:
+            log("WARN", f"视觉模型响应解析失败: {e}, body={resp.text[:200]}")
+            return None
+        choices = data.get("choices") or []
+        if not choices:
+            # 上游可能返回 {"error": {...}} / 限流体, 打印真实内容便于排障
+            log("WARN", f"视觉模型响应异常 (HTTP {resp.status_code}): {str(data)[:300]}")
+            return None
+        msg = choices[0].get("message") or {}
+        content = (msg.get("content") or "").strip()
+        if not content:
+            # 部分推理模型/网关把文本塞进 reasoning_content 或返回空 content (旧代码此处静默返回 None)
+            alt = (msg.get("reasoning_content") or "").strip()
+            log("WARN", f"视觉模型空 content: keys={list(msg.keys())} finish={msg.get('finish_reason')} reasoning={alt[:150]!r}")
+            m = re.search(r'\{[^{}]*"pick"[^{}]*\}', alt)
+            if m:
+                content = m.group(0)
+                log("INFO", f"从 reasoning_content 抢救出答案: {content}")
+        if msg.get("refusal"):
+            log("WARN", f"视觉模型拒绝回答: {str(msg['refusal'])[:100]}")
+        if content:
+            return content
+        if attempt == 1:
+            # 空 content 偶发, 重试一次
+            try:
+                resp = requests.post(
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                        ]}],
+                        "max_tokens": 300,
+                        "temperature": 0,
+                    },
+                    timeout=timeout,
+                )
+            except requests.exceptions.RequestException as e:
+                log("WARN", f"视觉模型重试请求失败: {e}")
+                return None
+            continue
+    return None
 
 
-def solve_recaptcha_ai(driver, max_rounds=4) -> bool:
+def solve_recaptcha_ai(driver, max_rounds=6) -> bool:
     """用视觉模型直接解 reCAPTCHA v2 图片挑战。
     流程: 切入 bframe iframe → 取题目+九宫格截图 → 模型选图 → 点击 → VERIFY → 轮询 token。
     reCAPTCHA 常有多轮, 每轮重复直到 g-recaptcha-response 出现值。"""
@@ -1238,7 +1271,7 @@ def ensure_signin_page_captcha_ready(driver, label=""):
                 log("INFO", f"✅ {label} reCAPTCHA 已存在有效 token")
             else:
                 # NopeCHA 无 key 死等无意义 → 直接上视觉模型解题
-                if solve_recaptcha_ai(driver, max_rounds=4):
+                if solve_recaptcha_ai(driver, max_rounds=6):
                     log("INFO", f"✅ {label} reCAPTCHA 由视觉模型解决")
                     return True
                 log("ERROR", f"❌ {label} reCAPTCHA 未能成功求解，放弃本次盲目提交以防 9999 报错")
