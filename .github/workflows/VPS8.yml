@@ -83,6 +83,15 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
 
+      - name: 拉取私有脚本库
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git clone --depth 1 https://x-access-token:${ACTIONS_PAT}@github.com/yuxiaojie0322-maker/my-private-scripts.git /tmp/priv
+          cp -r /tmp/priv/VPS8/scripts/* scripts/
+          rm -rf /tmp/priv
+        env:
+          ACTIONS_PAT: ${{ secrets.ACTIONS_PAT }}
+
       - name: 配置 Python 3.11
         if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v5
@@ -210,6 +219,15 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
 
+      - name: 拉取私有脚本库
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git clone --depth 1 https://x-access-token:${ACTIONS_PAT}@github.com/yuxiaojie0322-maker/my-private-scripts.git /tmp/priv
+          cp -r /tmp/priv/VPS8/scripts/* scripts/
+          rm -rf /tmp/priv
+        env:
+          ACTIONS_PAT: ${{ secrets.ACTIONS_PAT }}
+
       - name: 配置 Python 3.11
         if: steps.check.outputs.skip != 'true'
         uses: actions/setup-python@v5
@@ -336,6 +354,15 @@ jobs:
       - name: 检出代码仓库
         if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
+
+      - name: 拉取私有脚本库
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git clone --depth 1 https://x-access-token:${ACTIONS_PAT}@github.com/yuxiaojie0322-maker/my-private-scripts.git /tmp/priv
+          cp -r /tmp/priv/VPS8/scripts/* scripts/
+          rm -rf /tmp/priv
+        env:
+          ACTIONS_PAT: ${{ secrets.ACTIONS_PAT }}
 
       - name: 配置 Python 3.11
         if: steps.check.outputs.skip != 'true'
