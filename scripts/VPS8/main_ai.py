@@ -381,7 +381,7 @@ def _vision_chat(image_b64, prompt, timeout=60):
                     {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
                 ]}],
-                "max_tokens": 300,
+                "max_tokens": 3000,
                 "temperature": 0,
             },
             timeout=timeout,
@@ -407,10 +407,13 @@ def _vision_chat(image_b64, prompt, timeout=60):
             # 部分推理模型/网关把文本塞进 reasoning_content 或返回空 content (旧代码此处静默返回 None)
             alt = (msg.get("reasoning_content") or "").strip()
             log("WARN", f"视觉模型空 content: keys={list(msg.keys())} finish={msg.get('finish_reason')} reasoning={alt[:150]!r}")
-            m = re.search(r'\{[^{}]*"pick"[^{}]*\}', alt)
-            if m:
-                content = m.group(0)
-                log("INFO", f"从 reasoning_content 抢救出答案: {content}")
+            # 推理模型思考开头会复述题目里的占位符 {"pick": [编号...]}, 必须抓最后一个且含真实数字的 JSON
+            cands = re.findall(r'\{[^{}]*"pick"[^{}]*\}', alt)
+            for cand in reversed(cands):
+                if re.search(r'"pick"\s*:\s*\[\s*\d', cand):
+                    content = cand
+                    log("INFO", f"从 reasoning_content 抢救出答案: {content}")
+                    break
         if msg.get("refusal"):
             log("WARN", f"视觉模型拒绝回答: {str(msg['refusal'])[:100]}")
         if content:
@@ -427,7 +430,7 @@ def _vision_chat(image_b64, prompt, timeout=60):
                             {"type": "text", "text": prompt},
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
                         ]}],
-                        "max_tokens": 300,
+                        "max_tokens": 3000,
                         "temperature": 0,
                     },
                     timeout=timeout,
