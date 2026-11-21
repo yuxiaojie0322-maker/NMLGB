@@ -183,17 +183,6 @@ jobs:
         timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
-      - name: 上传执行截图
-        if: always() && steps.check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots-${{ github.job }}-${{ github.run_number }}
-          path: |
-            screenshots-attempt1/
-            screenshots/
-          retention-days: 3
-          if-no-files-found: ignore
-
   # ========================= F2 =========================
   sign-f2:
     name: F2 签到
@@ -320,17 +309,6 @@ jobs:
         if: steps.check.outputs.skip != 'true' && steps.attempt1.outcome == 'failure'
         timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
-
-      - name: 上传执行截图
-        if: always() && steps.check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots-${{ github.job }}-${{ github.run_number }}
-          path: |
-            screenshots-attempt1/
-            screenshots/
-          retention-days: 3
-          if-no-files-found: ignore
 
   # ========================= F3 =========================
   sign-f3:
@@ -459,17 +437,6 @@ jobs:
         timeout-minutes: 15
         run: xvfb-run -a --server-args="-screen 0 1280x720x24" python -u scripts/VPS8/main_ai.py
 
-      - name: 上传执行截图
-        if: always() && steps.check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots-${{ github.job }}-${{ github.run_number }}
-          path: |
-            screenshots-attempt1/
-            screenshots/
-          retention-days: 3
-          if-no-files-found: ignore
-
   # ========================= 统一维护与清理 =========================
   maintenance:
     name: 仓库保活与清理历史记录
@@ -501,38 +468,27 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const KEEP = 2;
+            // 大爷要求: 不留任何运行日志。遍历仓库全部 workflow, 删除所有已完成 run (含本次)
             const workflows = await github.rest.actions.listRepoWorkflows({
               owner: context.repo.owner,
               repo:  context.repo.repo,
             });
-            const wf = workflows.data.workflows.find(w => w.name === "VPS8 自动签到与续期");
-            if (!wf) {
-              console.log("未找到 workflow，跳过清理");
-              return;
-            }
-            const runs = await github.paginate(
-              github.rest.actions.listWorkflowRuns,
-              {
-                owner:       context.repo.owner,
-                repo:        context.repo.repo,
-                workflow_id: wf.id,
-                per_page:    100,
-              }
-            );
-            // 排除当前正在运行的本次任务以及未完成的任务
-            const completedRuns = runs.filter(r => r.id !== context.runId && r.status === 'completed');
-            const toDelete = completedRuns.slice(KEEP);
-            console.log(`历史完成记录共 ${completedRuns.length} 条，保留 ${KEEP} 条，准备清理 ${toDelete.length} 条`);
-            for (const run of toDelete) {
-              try {
-                await github.rest.actions.deleteWorkflowRun({
-                  owner:  context.repo.owner,
-                  repo:   context.repo.repo,
-                  run_id: run.id,
-                });
-                console.log(`已删除历史记录 #${run.run_number} (id=${run.id})`);
-              } catch (err) {
-                console.warn(`跳过删除历史记录 #${run.run_number}: ${err.message}`);
+            for (const wf of workflows.data.workflows) {
+              const runs = await github.paginate(
+                github.rest.actions.listWorkflowRuns,
+                { owner: context.repo.owner, repo: context.repo.repo, workflow_id: wf.id, per_page: 100 }
+              );
+              const toDelete = runs.filter(r => r.status === 'completed');
+              for (const run of toDelete) {
+                try {
+                  await github.rest.actions.deleteWorkflowRun({
+                    owner: context.repo.owner,
+                    repo:  context.repo.repo,
+                    run_id: run.id,
+                  });
+                } catch (err) {
+                  // 删除失败静默跳过
+                }
               }
             }
+            console.log('历史记录清理完毕');
